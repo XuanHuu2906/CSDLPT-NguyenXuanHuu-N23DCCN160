@@ -194,6 +194,11 @@
     width: 100%; border: 1px solid #e2e8f0; border-radius: 10px;
     background: #fafafa; padding: 12px;
   }
+  .chart-gallery .chart-placeholder {
+    width: 100%; border: 1px dashed #cbd5e1; border-radius: 10px;
+    padding: 40px 12px; text-align: center; color: #94a3b8;
+    font-size: 14px; background: #f8fafc;
+  }
 
   /* ===== Peer Controls ===== */
   .peer-toolbar {
@@ -383,6 +388,10 @@
             <tr>
               <th>Nodes Killed</th>
               <th>Matched Peers</th>
+              <th>Holders Left</th>
+              <th>Reachable Holders</th>
+              <th>Source Neighbors</th>
+              <th>Source Component</th>
               <th>Coverage Change</th>
             </tr>
           </thead>
@@ -492,11 +501,37 @@ setInterval(refreshPeers, 5000);
 (async function restoreAnalysis() {
   try {
     const r = await fetch("/api/analysis/results");
-    const stats = await r.json();
-    if (!stats) return;
-    renderStatsTable(stats);
+    const data = await r.json();
+    if (!data) return;
+
+    // New format: {stats, charts}
+    if (data.stats) {
+      renderStatsTable(data.stats);
+    }
+    // Show any chart files that exist on disk
+    if (data.charts && data.charts.length > 0) {
+      renderCharts(data.charts);
+    }
   } catch(_) {}
 })();
+
+function renderCharts(chartNames) {
+  const gallery = document.getElementById("chart-gallery");
+  gallery.innerHTML = "";
+  chartNames.forEach(name => {
+    const img = document.createElement("img");
+    img.src = "/api/charts/" + name + "?" + Date.now();
+    img.alt = name;
+    img.onerror = function() {
+      const fallback = document.createElement("div");
+      fallback.className = "chart-placeholder";
+      fallback.textContent = name + " (not generated)";
+      this.replaceWith(fallback);
+    };
+    gallery.appendChild(img);
+  });
+  gallery.classList.add("show");
+}
 
 function renderStatsTable(stats) {
   const tbody = document.getElementById("stats-body");
@@ -509,28 +544,11 @@ function renderStatsTable(stats) {
       <td><strong>${ttl}</strong></td>
       <td>${s.matched_mean.toFixed(1)} &plusmn; ${s.matched_std.toFixed(1)} [${s.matched_min},${s.matched_max}]</td>
       <td>${s.sent_mean.toFixed(1)} &plusmn; ${s.sent_std.toFixed(1)}</td>
-      <td>${s.dup_ratio.toFixed(1)}%</td>
+      <td>${(s.dup_ratio_mean * 100).toFixed(1)}%</td>
     `;
     tbody.appendChild(tr);
   });
   document.getElementById("stats-table-wrap").classList.add("show");
-
-  // Restore charts if they exist
-  const chartNames = [
-    "chart_coverage_vs_overhead.png",
-    "chart_ttl_metrics.png",
-    "chart_duplicate_ratio.png",
-    "topology_graph.png"
-  ];
-  const gallery = document.getElementById("chart-gallery");
-  gallery.innerHTML = "";
-  chartNames.forEach(name => {
-    const img = document.createElement("img");
-    img.src = "/api/charts/" + name;
-    img.alt = name;
-    gallery.appendChild(img);
-  });
-  gallery.classList.add("show");
 }
 
 // ===== Search Demo =====
@@ -556,9 +574,9 @@ document.getElementById("query-form").addEventListener("submit", async function(
     document.getElementById("qr-matched").textContent = data.matched_peers_count;
     document.getElementById("qr-sent").textContent = data.messages_sent;
     document.getElementById("qr-dropped").textContent = data.duplicate_queries_dropped;
-    document.getElementById("qr-ratio").textContent = data.duplicate_ratio + "%";
+    document.getElementById("qr-ratio").textContent = data.duplicate_ratio;
     document.getElementById("qr-meta").textContent =
-      `Source: Peer ${data.source_id}  ·  Keyword: "${data.keyword}"  ·  TTL: ${data.ttl}`;
+      `Source: Peer ${data.source_id}  -  Keyword: "${data.keyword}"  -  TTL: ${data.ttl}`;
     document.getElementById("query-result").classList.add("show");
   } catch(e) {
     alert("Query failed: " + e.message);
@@ -569,6 +587,8 @@ document.getElementById("query-form").addEventListener("submit", async function(
 
 // ===== TTL Analysis =====
 let _analysisEventSource = null;
+let _analysisDone = false;
+let _analysisStarted = false;
 
 function runAnalysis() {
   const btn = document.getElementById("btn-analysis");
@@ -580,6 +600,8 @@ function runAnalysis() {
     _analysisEventSource = null;
   }
 
+  _analysisDone = false;
+  _analysisStarted = false;
   document.getElementById("analysis-progress").classList.add("show");
   document.getElementById("analysis-log").innerHTML = "";
   document.getElementById("progress-fill").style.width = "0%";
@@ -607,18 +629,12 @@ function runAnalysis() {
 
   evtSource.addEventListener("charts", function(e) {
     const names = JSON.parse(e.data);
-    const gallery = document.getElementById("chart-gallery");
-    gallery.innerHTML = "";
-    names.forEach(name => {
-      const img = document.createElement("img");
-      img.src = "/api/charts/" + name;
-      img.alt = name;
-      gallery.appendChild(img);
-    });
-    gallery.classList.add("show");
+    renderCharts(names);
   });
 
   evtSource.addEventListener("ready", function() {
+    if (_analysisDone || _analysisStarted) return;
+    _analysisStarted = true;
     fetch("/api/analysis/run", { method: "POST" }).then(r => {
       if (r.status === 429) {
         evtSource.close();
@@ -633,6 +649,7 @@ function runAnalysis() {
   });
 
   evtSource.addEventListener("done", function() {
+    _analysisDone = true;
     evtSource.close();
     document.getElementById("progress-fill").style.width = "100%";
     document.getElementById("btn-analysis").disabled = false;
@@ -659,40 +676,75 @@ async function runFailureDemo() {
     log.scrollTop = log.scrollHeight;
   }
 
-  addLog("Starting failure experiment...");
-  addLog("Killing top 20 high-degree nodes incrementally...");
+  addLog("Starting failure experiment (Hub Attack)...");
+  addLog("Killing high-degree hub nodes (non-holders)...");
 
   try {
     const r = await fetch("/api/failure/run", { method: "POST" });
-    const results = await r.json();
+    const data = await r.json();
+    const results = Array.isArray(data) ? data : (data.results || []);
 
     document.getElementById("failure-fill").style.width = "100%";
+    if (!r.ok || data.ok === false) {
+      const msg = data.error || "Failure experiment failed.";
+      addLog("ERROR: " + msg);
+      if (data.traceback) addLog(data.traceback);
+      document.getElementById("failure-status").textContent = "Failed: " + msg;
+      return;
+    }
     addLog("Done.");
+    if (data.chart_error) addLog("WARNING: " + data.chart_error);
+
+    if (!results || results.length === 0) {
+      addLog("WARNING: Experiment returned no results. The keyword may not have enough copies, or network is unstable.");
+      document.getElementById("failure-status").textContent = "Failed: no results.";
+      btn.disabled = false; btn.textContent = "Run Failure Experiment";
+      return;
+    }
+
+    const first = results[0];
+    if (first.keyword !== undefined && first.source_id !== undefined) {
+      addLog("Keyword: " + first.keyword + " | Source: Peer " + first.source_id + " | TTL: " + (first.ttl || 5));
+      if (Array.isArray(first.kill_list)) addLog("Kill list: " + first.kill_list.join(", "));
+    }
 
     // Render table
     const tbody = document.getElementById("failure-body");
     tbody.innerHTML = "";
     const baseline = results[0].matched;
+    const holdersLeft = results[0].holders_left || results[0].remaining_holders || 0;
     results.forEach((row, i) => {
       const tr = document.createElement("tr");
       const change = row.matched - baseline;
       const changeStr = (change === 0 ? "0" : (change > 0 ? "+" : "") + change);
       const changeColor = change >= 0 ? "#2e7d32" : "#c62828";
+      const holders = row.holders_left || row.remaining_holders || holdersLeft;
+      const pct = holders > 0 ? (row.matched / holders * 100).toFixed(1) : "0.0";
       tr.innerHTML = `
         <td><strong>${row.killed}</strong></td>
         <td>${row.matched}</td>
-        <td style="color:${changeColor};font-weight:600">${changeStr}</td>
+        <td>${holders}</td>
+        <td>${row.reachable_holders ?? "-"}</td>
+        <td>${row.source_alive_neighbors ?? "-"}</td>
+        <td>${row.source_component_size ?? "-"}</td>
+        <td style="color:${changeColor};font-weight:600">${changeStr}&nbsp;(${pct}%)</td>
       `;
       tbody.appendChild(tr);
     });
     document.getElementById("failure-results").style.display = "block";
 
-    // Show chart
-    const img = document.getElementById("failure-chart-img");
-    img.src = "/api/charts/chart_failure_case.png?" + Date.now();
-    document.getElementById("failure-chart").style.display = "block";
+    if (data.chart_generated) {
+      const img = document.getElementById("failure-chart-img");
+      img.src = "/api/charts/chart_failure_case.png?" + Date.now();
+      document.getElementById("failure-chart").style.display = "block";
+    } else {
+      document.getElementById("failure-chart").style.display = "none";
+    }
+    const last = results[results.length-1];
+    const lastHolders = last.holders_left || last.remaining_holders || holdersLeft;
+    const lastPct = lastHolders > 0 ? (last.matched / lastHolders * 100).toFixed(1) : "0.0";
     document.getElementById("failure-status").textContent =
-      "Done. Coverage dropped from " + baseline + " to " + results[results.length-1].matched + " after killing " + results[results.length-1].killed + " nodes.";
+      "Done. Coverage: " + baseline + "/" + holdersLeft + " -> " + last.matched + "/" + holdersLeft + " (" + lastPct + "%) after killing " + last.killed + " hubs.";
 
   } catch(e) {
     addLog("ERROR: " + e.message);

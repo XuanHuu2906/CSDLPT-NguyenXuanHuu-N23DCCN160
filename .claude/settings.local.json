@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rtk read *)",
+      "Bash(rtk ls *)",
+      "Bash(python -u query.py 0 data 5)",
+      "Bash(python -u failure_demo.py)",
+      "Bash(pkill -f \"node.py\")",
+      "PowerShell(python D:\\\\CSDLPT\\\\CuoiKy\\\\bootstrap.py)",
+      "PowerShell(python D:\\\\CSDLPT\\\\CuoiKy\\\\_smoke_test.py)",
+      "PowerShell(taskkill *)"
+    ]
+  }
+}

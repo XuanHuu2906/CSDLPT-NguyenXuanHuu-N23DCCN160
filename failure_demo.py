@@ -1,5 +1,5 @@
 """
-Failure Demo Script — P2P Churn Resilience
+Failure Demo Script - P2P Churn Resilience
 
 Demonstrates the impact of killing high-degree nodes on search coverage.
 Compares metrics before and after failure.
@@ -20,7 +20,7 @@ import time
 
 from query import (
     ALL_PORTS, send_query, reset_all_peers,
-    collect_all_metrics, send_message
+    collect_all_metrics, send_message, restart_all_peers, is_port_free
 )
 
 BLOCKED_PEERS = set()  # No blocked peers with port range 6000-6099
@@ -50,10 +50,15 @@ def count_peers_with_file(topology, keyword):
     )
 
 
-async def run_query(label, source_port, keyword, ttl=5):
-    """Run a single query and collect extended metrics."""
-    await reset_all_peers()
-    metrics = await send_query(source_port, keyword, ttl)
+async def run_query(label, source_port, keyword, ttl=5, alive_ports=None,
+                     valid_ports=None):
+    """Run a single query and collect extended metrics.
+
+    If *alive_ports* is provided, only those peers are RESET.
+    If *valid_ports* is provided, matched is filtered to only count those ports.
+    """
+    await reset_all_peers(ports=alive_ports)
+    metrics = await send_query(source_port, keyword, ttl, valid_ports=valid_ports)
 
     total_with_file = count_peers_with_file(load_topology(), keyword)
     coverage_ratio = metrics["matched_peers_count"] / max(total_with_file, 1)
@@ -93,52 +98,135 @@ async def run_query(label, source_port, keyword, ttl=5):
 
 
 async def main():
+    """Hub Attack: kill high-degree nodes that do NOT hold the keyword.
+
+    Demonstrates that killing hubs fragments the overlay, reducing query
+    coverage even though all keyword copies remain in the network.
+    """
     topology = load_topology()
     adj = build_adjacency(topology)
     pool = get_file_pool(topology)
+    all_ports = [p["port"] for p in topology["peers"]]
 
-    # Find high-degree nodes
-    degrees = sorted(
-        range(100), key=lambda i: len(adj[i]), reverse=True
-    )
-    high_degree_ids = [d for d in degrees if d not in BLOCKED_PEERS][:K]
+    node_degree = {i: len(adj[i]) for i in range(100)}
+    degree_rank = sorted(range(100), key=lambda i: node_degree[i], reverse=True)
 
-    # Pick a source that is NOT a high-degree node
+    # ---- Restart all peers cleanly ----
+    print("Restarting all peers for clean state...")
+    await restart_all_peers()
+
+    # ---- Pick keyword with the most copies (>=10) ----
+    keyword = None
+    keyword_holders = set()
+    for kw in sorted(pool, key=lambda k: -sum(
+            1 for i in range(100)
+            if k in topology["files"].get(str(i), [])
+            and i not in BLOCKED_PEERS
+    )):
+        holders = {i for i in range(100)
+                   if kw in topology["files"].get(str(i), [])
+                   and i not in BLOCKED_PEERS}
+        if len(holders) >= 10:
+            keyword = kw
+            keyword_holders = holders
+            break
+
+    if keyword is None:
+        print("ERROR: no keyword with >=10 copies found. Aborting.")
+        return
+
+    total_holders = len(keyword_holders)
+    keyword_holder_ports = {topology["peers"][i]["port"] for i in keyword_holders}
+
+    # ---- Build kill-list: top K hubs EXCLUDING keyword-holders ----
+    kill_ids = []
+    for node_id in degree_rank:
+        if len(kill_ids) >= K:
+            break
+        if node_id in keyword_holders:
+            continue
+        if node_id in BLOCKED_PEERS:
+            continue
+        kill_ids.append(node_id)
+
+    if len(kill_ids) < 1:
+        print("ERROR: no non-holder hubs to kill. Aborting.")
+        return
+
+    # ---- Pick source: not in kill-list, not a keyword-holder ----
     source_id = next(
-        i for i in range(100)
-        if i not in high_degree_ids and i not in BLOCKED_PEERS
+        (i for i in range(100)
+         if i not in kill_ids
+         and i not in keyword_holders
+         and i not in BLOCKED_PEERS),
+        None
     )
+    if source_id is None:
+        print("ERROR: no valid source found. Aborting.")
+        return
     source_port = topology["peers"][source_id]["port"]
-    keyword = random.choice(pool)
 
     print("=" * 60)
-    print("P2P FAILURE DEMO — Churn Resilience Test")
+    print("P2P FAILURE DEMO - Hub Attack (Churn Resilience Test)")
     print("=" * 60)
     print(f"\nTopology: 100 peers")
-    print(f"High-degree nodes to kill: {high_degree_ids}")
+    print(f"Nodes to kill (hubs, non-holders): {kill_ids}")
     print(f"Source peer:               {source_id} (port {source_port})")
     print(f"Keyword:                   '{keyword}'")
+    print(f"Total holders:             {total_holders}")
 
-    # ---- Before failure ----
+    # ---- Phase 1: Before failure ----
     print(f"\n--- Phase 1: Before failure ---")
-    before = await run_query("BEFORE", source_port, keyword)
+    valid_ports = list(keyword_holder_ports)
+    before = await run_query("BEFORE", source_port, keyword,
+                             valid_ports=valid_ports)
+    if before["matched_peers_count"] == 0:
+        print("ERROR: baseline=0. Aborting.")
+        return
 
-    # ---- Kill high-degree nodes ----
-    print(f"\n--- Phase 2: Killing {K} high-degree nodes ---")
-    for node_id in high_degree_ids:
-        print(f"  Sending SHUTDOWN to Peer {node_id}...")
-        await send_message(topology["peers"][node_id]["port"], {"type": "SHUTDOWN"})
-    print(f"  Waiting for heartbeat to detect failures...")
-    await asyncio.sleep(6)  # Wait for at least one heartbeat cycle
+    # ---- Phase 2: Kill hubs ----
+    print(f"\n--- Phase 2: Killing {len(kill_ids)} hub nodes "
+          f"(non-holders of '{keyword}') ---")
+    killed_ports = set()
 
-    # ---- After failure ----
+    for node_id in kill_ids:
+        port = topology["peers"][node_id]["port"]
+        print(f"  Sending SHUTDOWN to Peer {node_id} (port {port})...")
+        ok = await send_message(port, {"type": "SHUTDOWN"})
+        if not ok:
+            print(f"  WARNING: SHUTDOWN delivery failed for Peer {node_id}")
+
+    print(f"  Verifying nodes are dead...")
+    actually_dead = []
+    for node_id in kill_ids:
+        port = topology["peers"][node_id]["port"]
+        dead = False
+        for _ in range(10):
+            if is_port_free(port):
+                dead = True
+                break
+            await asyncio.sleep(0.5)
+        if dead:
+            killed_ports.add(port)
+            actually_dead.append(node_id)
+        else:
+            print(f"  WARNING: Peer {node_id} (port {port}) still alive - excluded")
+    print(f"  {len(actually_dead)}/{len(kill_ids)} nodes confirmed dead: {actually_dead}")
+
+    # ---- Phase 3: After failure ----
     print(f"\n--- Phase 3: After failure ---")
-    after = await run_query("AFTER", source_port, keyword)
+    alive_ports = [p for p in all_ports if p not in killed_ports]
+    alive_set = set(alive_ports)
+    valid_ports = list(keyword_holder_ports & alive_set)
+    after = await run_query("AFTER", source_port, keyword,
+                            alive_ports=alive_ports,
+                            valid_ports=valid_ports)
 
     # ---- Summary ----
     print(f"\n" + "=" * 60)
-    print("FAILURE DEMO SUMMARY")
+    print("FAILURE DEMO SUMMARY - Hub Attack")
     print("=" * 60)
+    print(f"Holders left (constant): {total_holders}")
     print(f"{'Metric':<30} {'Before':>10} {'After':>10} {'Change':>10}")
     print("-" * 60)
     print(
@@ -147,9 +235,9 @@ async def main():
         f"{after['matched_peers_count'] - before['matched_peers_count']:>+10}"
     )
     print(
-        f"{'coverage_ratio':<30} {before['coverage_ratio']:.2f}{'':>8} "
-        f"{after['coverage_ratio']:.2f}{'':>8} "
-        f"{after['coverage_ratio'] - before['coverage_ratio']:+.2f}{'':>8}"
+        f"{'coverage_ratio':<30} {before['coverage_ratio']:.3f}{'':>8} "
+        f"{after['coverage_ratio']:.3f}{'':>8} "
+        f"{after['coverage_ratio'] - before['coverage_ratio']:+.3f}{'':>8}"
     )
     print(
         f"{'messages_sent':<30} {before['messages_sent']:>10} "
@@ -186,11 +274,12 @@ async def main():
     # ---- Save report ----
     os.makedirs("results", exist_ok=True)
     with open("results/failure_report.txt", "w") as f:
-        f.write("Failure Demo Report\n")
+        f.write("Failure Demo Report - Hub Attack\n")
         f.write("-" * 50 + "\n")
-        f.write(f"Killed nodes: {high_degree_ids}\n")
+        f.write(f"Killed hubs (non-holders): {kill_ids}\n")
         f.write(f"Source peer:  {source_id}\n")
         f.write(f"Keyword:      '{keyword}'\n")
+        f.write(f"Total holders: {total_holders} (constant)\n")
         f.write(f"TTL:          5\n\n")
         f.write(f"{'Metric':<30} {'Before':>10} {'After':>10}\n")
         f.write("-" * 50 + "\n")
@@ -205,12 +294,11 @@ async def main():
                 f.write(f"{key:<30} {b:>10} {a:>10}\n")
         f.write("\nExplanation:\n")
         f.write(
-            "After high-degree nodes leave, the overlay loses important "
-            "routing paths.\n"
-            "Peers detect failed neighbors via heartbeat and stop forwarding "
-            "messages to them.\n"
-            "Search still works if the remaining overlay is connected, "
-            "but coverage may decrease.\n"
+            "Killing high-degree hub nodes fragments the overlay, making it "
+            "harder for queries to reach keyword-holders.\n"
+            "File copies still exist (holders_left is constant), but the "
+            "TTL-limited flood can no longer reach them all.\n"
+            "Coverage decreases as more hubs are removed.\n"
         )
     print(f"\nSaved: results/failure_report.txt")
 
@@ -247,8 +335,8 @@ async def main():
         ax2.grid(True, alpha=0.3, axis='y')
 
         plt.suptitle(
-            f"Failure Demo: {K} High-Degree Nodes Killed\n"
-            f"(Nodes {high_degree_ids})",
+            f"Failure Demo: {len(kill_ids)} Keyword-Holding Nodes Killed\n"
+            f"(Nodes {kill_ids})",
             fontsize=14
         )
         plt.tight_layout()
@@ -256,7 +344,7 @@ async def main():
         plt.close()
         print("Saved: results/failure_before_after.png (chart)")
     except ImportError:
-        print("[failure_demo.py] matplotlib not installed — chart skipped")
+        print("[failure_demo.py] matplotlib not installed - chart skipped")
 
     print("\nDone.")
 

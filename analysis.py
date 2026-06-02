@@ -8,12 +8,12 @@ import statistics as st
 
 from query import (send_query, reset_all_peers,
                    collect_all_metrics, send_message, ALL_PORTS,
-                   restart_all_peers)
+                   restart_all_peers, is_port_free)
 
 BLOCKED_PEERS = set()  # No blocked peers with port range 6000-6099
 TTLS = [3, 5, 7]
 RUNS_PER_TTL = 10
-QUERY_TIMEOUT = 5
+QUERY_TIMEOUT = 5       # default for TTL <= 5; TTL=7 uses 8
 
 
 # =====================================================================
@@ -59,6 +59,83 @@ def bfs_reachable(topology, origin_id, ttl):
                     visited.add(nb)
                     queue.append((nb, dist + 1))
     return visited
+
+
+def failure_reachability_snapshot(topology, adj, source_id, keyword_holders,
+                                  killed_ids, ttl):
+    """Graph-side debug data for hub attack results."""
+    n = len(topology["peers"])
+    unavailable = set(killed_ids) | BLOCKED_PEERS
+    alive_nodes = set(range(n)) - unavailable
+
+    if source_id not in alive_nodes:
+        return {
+            "source_alive": False,
+            "source_alive_neighbors": 0,
+            "source_alive_neighbor_ids": [],
+            "reachable_holders": 0,
+            "reachable_holder_ids": [],
+            "ttl_reachable_size": 0,
+            "source_component_size": 0,
+        }
+
+    source_alive_neighbor_ids = sorted(
+        nb for nb in adj[source_id] if nb in alive_nodes
+    )
+
+    visited = {source_id}
+    queue = [(source_id, 0)]
+    for node, dist in queue:
+        if dist < ttl:
+            for nb in adj[node]:
+                if nb in alive_nodes and nb not in visited:
+                    visited.add(nb)
+                    queue.append((nb, dist + 1))
+
+    component = {source_id}
+    stack = [source_id]
+    while stack:
+        node = stack.pop()
+        for nb in adj[node]:
+            if nb in alive_nodes and nb not in component:
+                component.add(nb)
+                stack.append(nb)
+
+    reachable_holder_ids = sorted(visited & keyword_holders)
+    return {
+        "source_alive": True,
+        "source_alive_neighbors": len(source_alive_neighbor_ids),
+        "source_alive_neighbor_ids": source_alive_neighbor_ids,
+        "reachable_holders": len(reachable_holder_ids),
+        "reachable_holder_ids": reachable_holder_ids,
+        "ttl_reachable_size": len(visited),
+        "source_component_size": len(component),
+    }
+
+
+def choose_failure_source(topology, adj, keyword_holders, kill_list, ttl=5):
+    """Pick a deterministic non-holder source that survives the first batch."""
+    n = len(topology["peers"])
+    candidates = [
+        i for i in range(n)
+        if i not in kill_list
+        and i not in keyword_holders
+        and i not in BLOCKED_PEERS
+    ]
+
+    for source_id in candidates:
+        baseline = failure_reachability_snapshot(
+            topology, adj, source_id, keyword_holders, set(), ttl
+        )
+        after_first_batch = failure_reachability_snapshot(
+            topology, adj, source_id, keyword_holders, set(kill_list[:5]), ttl
+        )
+        if (baseline["reachable_holders"] > 0
+                and after_first_batch["source_alive_neighbors"] > 0
+                and after_first_batch["reachable_holders"] > 0):
+            return source_id
+
+    return candidates[0] if candidates else None
 
 
 def get_file_pool(topology):
@@ -121,6 +198,7 @@ async def run_single_experiment(source_port, keyword, ttl, timeout=QUERY_TIMEOUT
     metrics["overhead_per_match"] = (
         metrics["messages_sent"] / max(metrics["matched_peers_count"], 1)
     )
+    metrics["fallback_used"] = metrics.get("fallback_used", 0)
 
     return metrics
 
@@ -160,7 +238,8 @@ async def run_experiments(ttl_values=None, n_runs=None):
               f"total_peers_having_file={case['total_with_file']}")
         for ttl in ttl_values:
             metrics = await run_single_experiment(
-                case["source_port"], case["keyword"], ttl
+                case["source_port"], case["keyword"], ttl,
+                timeout=5 if ttl <= 5 else 12
             )
             metrics["run"] = case_idx
             all_results.append(metrics)
@@ -239,7 +318,8 @@ CSV_COLUMNS = [
     "messages_sent", "duplicate_queries_dropped", "duplicate_ratio",
     "avg_hops", "min_hops", "max_hops",
     "avg_latency_ms", "min_latency_ms", "max_latency_ms",
-    "failed_forward_count", "dead_neighbors_detected", "overhead_per_match"
+    "failed_forward_count", "dead_neighbors_detected", "overhead_per_match",
+    "fallback_used"
 ]
 
 
@@ -326,7 +406,7 @@ try:
     HAVE_MPL = True
 except ImportError:
     HAVE_MPL = False
-    print("[analysis.py] matplotlib not installed — charts will be skipped")
+    print("[analysis.py] matplotlib not installed - charts will be skipped")
 
 # NetworkX for topology graphs
 try:
@@ -334,7 +414,7 @@ try:
     HAVE_NX = True
 except ImportError:
     HAVE_NX = False
-    print("[analysis.py] networkx not installed — topology graphs will be skipped")
+    print("[analysis.py] networkx not installed - topology graphs will be skipped")
 
 
 def plot_coverage_vs_overhead(stats):
@@ -356,8 +436,8 @@ def plot_coverage_vs_overhead(stats):
             xy=(s["sent_mean"], s["coverage_mean"]),
             xytext=(10, 8), textcoords='offset points', fontsize=11
         )
-    ax.set_xlabel("Total Messages Sent — Network Overhead", fontsize=12)
-    ax.set_ylabel("Coverage Ratio — Search Coverage", fontsize=12)
+    ax.set_xlabel("Total Messages Sent - Network Overhead", fontsize=12)
+    ax.set_ylabel("Coverage Ratio - Search Coverage", fontsize=12)
     ax.set_title(
         "Search Coverage vs Network Overhead\n"
         "(Gnutella-style Flooding, 100 peers)",
@@ -373,7 +453,7 @@ def plot_coverage_vs_overhead(stats):
 
 
 def plot_ttl_metrics(stats):
-    """2×2 subplot: coverage, messages, duplicate ratio, latency."""
+    """2x2 subplot: coverage, messages, duplicate ratio, latency."""
     ttls = sorted(stats.keys())
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
@@ -511,6 +591,15 @@ def save_topology_graph(topology):
 def save_query_propagation_graph(topology, origin_id, keyword, ttl, suffix):
     """BFS from origin to find reachable nodes, highlight matches."""
     if not HAVE_NX or not HAVE_MPL:
+        missing = []
+        if not HAVE_NX:
+            missing.append("networkx")
+        if not HAVE_MPL:
+            missing.append("matplotlib")
+        print(
+            f"[analysis.py] Skipping query propagation graph TTL={ttl}: "
+            f"{' and '.join(missing)} not installed"
+        )
         return
 
     G = nx.Graph()
@@ -573,7 +662,7 @@ def save_query_propagation_graph(topology, origin_id, keyword, ttl, suffix):
     ax.legend(handles=legend_elements, loc='upper right', fontsize=10)
 
     ax.set_title(
-        f"Query Propagation — TTL={ttl}\n"
+        f"Query Propagation - TTL={ttl}\n"
         f"Origin=Peer {origin_id}, Keyword='{keyword}'",
         fontsize=14
     )
@@ -590,7 +679,7 @@ def save_query_propagation_graph(topology, origin_id, keyword, ttl, suffix):
 # =====================================================================
 def save_topology_stats(topology):
     if not HAVE_NX:
-        print("[analysis.py] networkx not installed — topology stats will be basic")
+        print("[analysis.py] networkx not installed - topology stats will be basic")
         _save_topology_stats_basic(topology)
         return
 
@@ -684,64 +773,230 @@ def _save_topology_stats_basic(topology):
 # Failure experiment
 # =====================================================================
 async def run_failure_experiment(topology):
-    adj = build_adjacency(topology)
-    degrees = sorted(range(100), key=lambda i: len(adj[i]), reverse=True)
-    high_degree_ids = degrees[:20]
+    """Hub Attack: kill high-degree nodes that do NOT hold the keyword.
 
-    source_id = next(
-        i for i in range(100)
-        if i not in high_degree_ids and i not in BLOCKED_PEERS
-    )
-    source_port = topology["peers"][source_id]["port"]
-    keyword = random.choice(get_file_pool(topology))
+    Holders_left stays constant across all batches.  Matched is filtered
+    to only count keyword-holders that are still alive, so coverage drops
+    as the network fragments even though file copies remain.
+    """
+    adj = build_adjacency(topology)
+    node_degree = {i: len(adj[i]) for i in range(100)}
+    degree_rank = sorted(range(100), key=lambda i: node_degree[i], reverse=True)
 
     results = []
 
-    # Baseline (0 killed)
+    # 1) Restart ALL peers cleanly
+    print("  Restarting all peers for clean state...")
+    await restart_all_peers()
+
+    # 2) Pick keyword with the most copies (>=10 required for stable baseline)
+    pool = get_file_pool(topology)
+    keyword = None
+    keyword_holders = set()
+    for kw in sorted(pool, key=lambda k: -sum(
+            1 for i in range(100)
+            if k in topology["files"].get(str(i), [])
+            and i not in BLOCKED_PEERS
+    )):
+        holders = {i for i in range(100)
+                   if kw in topology["files"].get(str(i), [])
+                   and i not in BLOCKED_PEERS}
+        if len(holders) >= 10:
+            keyword = kw
+            keyword_holders = holders
+            break
+
+    if keyword is None:
+        print("  ERROR: no keyword with >=10 copies found. Aborting.")
+        return results
+
+    total_holders = len(keyword_holders)
+    keyword_holder_ports = {topology["peers"][i]["port"] for i in keyword_holders}
+
+    # 3) Build kill-list: top 20 highest-degree nodes EXCLUDING keyword-holders
+    kill_list = []
+    for node_id in degree_rank:
+        if len(kill_list) >= 20:
+            break
+        if node_id in keyword_holders:
+            continue  # never kill a keyword-holder
+        if node_id in BLOCKED_PEERS:
+            continue
+        kill_list.append(node_id)
+
+    if len(kill_list) < 5:
+        print("  ERROR: not enough non-holder hubs to kill. Aborting.")
+        return results
+
+    # 4) Pick source: not in kill-list, not a keyword-holder, and not
+    # isolated by the first batch in the graph model.
+    source_id = choose_failure_source(
+        topology, adj, keyword_holders, kill_list, ttl=5
+    )
+    if source_id is None:
+        print("  ERROR: no valid source found. Aborting.")
+        return results
+    source_port = topology["peers"][source_id]["port"]
+
+    # ---- Phase 1: Baseline ----
     await reset_all_peers()
-    metrics = await send_query(source_port, keyword, ttl=5)
-    results.append({"killed": 0, "matched": metrics["matched_peers_count"]})
-    print(f"Baseline (0 killed): matched={metrics['matched_peers_count']}")
+    valid_ports = list(keyword_holder_ports)  # all holders are alive
+    metrics = await send_query(source_port, keyword, ttl=5, timeout=QUERY_TIMEOUT,
+                               valid_ports=valid_ports)
+    baseline_matched = metrics["matched_peers_count"]
+    if baseline_matched == 0:
+        print(f"  ERROR: baseline=0 for keyword='{keyword}'. Aborting.")
+        return results
 
-    # Incrementally kill high-degree nodes (5 per batch)
-    killed = []
-    for step in range(4):
-        to_kill = high_degree_ids[step * 5: (step + 1) * 5]
-        for node_id in to_kill:
-            await send_message(topology["peers"][node_id]["port"], {"type": "SHUTDOWN"})
-            killed.append(node_id)
-        await asyncio.sleep(1.0)
+    print(
+        f"  Keyword='{keyword}' -> {total_holders} copies, "
+        f"source={source_id}, kill_list={kill_list[:20]} "
+        "(hubs, non-holders)"
+    )
+    debug = failure_reachability_snapshot(
+        topology, adj, source_id, keyword_holders, set(), ttl=5
+    )
+    results.append({
+        "killed": 0,
+        "matched": baseline_matched,
+        "holders_left": total_holders,
+        "keyword": keyword,
+        "source_id": source_id,
+        "source_port": source_port,
+        "ttl": 5,
+        "kill_list": kill_list[:20],
+        "killed_ids": [],
+        **debug,
+    })
+    coverage = baseline_matched / max(total_holders, 1) * 100
+    print(f"  Baseline (0 killed): matched={baseline_matched}/{total_holders} "
+          f"({coverage:.1f}%), reachable={debug['reachable_holders']}, "
+          f"source_neighbors={debug['source_alive_neighbors']}")
 
-        await reset_all_peers()
-        metrics = await send_query(source_port, keyword, ttl=5)
+    # ---- Phase 2: Incrementally kill hubs (5 per batch) ----
+    killed_ports = set()
+    killed_ids = set()
+
+    max_batches = min(4, (len(kill_list) + 4) // 5)
+    for step in range(max_batches):
+        batch = kill_list[step * 5: (step + 1) * 5]
+        if not batch:
+            break
+
+        batch_killed = set()
+        for node_id in batch:
+            port = topology["peers"][node_id]["port"]
+            ok = await send_message(port, {"type": "SHUTDOWN"})
+            if not ok:
+                print(f"  WARNING: SHUTDOWN delivery failed for Peer {node_id} "
+                      f"(port {port})")
+
+        for node_id in batch:
+            port = topology["peers"][node_id]["port"]
+            dead = False
+            port_free = False
+            ping_ok = True
+            for _ in range(10):
+                port_free = is_port_free(port)
+                ping_ok = await send_message(
+                    port, {"type": "PING"}, connect_timeout=0.2
+                )
+                if not ping_ok:
+                    dead = True
+                    break
+                await asyncio.sleep(0.5)
+            if dead:
+                killed_ports.add(port)
+                killed_ids.add(node_id)
+                batch_killed.add(node_id)
+                if not port_free:
+                    print(f"  Peer {node_id} no longer accepts PING, "
+                          "but its port is still occupied.")
+            else:
+                print(f"  WARNING: Peer {node_id} (port {port}) still alive "
+                      f"- excluding from killed set")
+
+        if not batch_killed:
+            print("  WARNING: No peers actually died. Skipping batch.")
+            continue
+
+        # Reset alive peers, compute valid_ports = holders that are still alive
+        alive_ports = [p for p in ALL_PORTS if p not in killed_ports]
+        alive_set = set(alive_ports)
+        await reset_all_peers(ports=alive_ports)
+
+        valid_ports = list(keyword_holder_ports & alive_set)
+        metrics = await send_query(source_port, keyword, ttl=5,
+                                   timeout=QUERY_TIMEOUT,
+                                   valid_ports=valid_ports)
+        matched = metrics["matched_peers_count"]
+        debug = failure_reachability_snapshot(
+            topology, adj, source_id, keyword_holders, killed_ids, ttl=5
+        )
         results.append({
-            "killed": len(killed),
-            "matched": metrics["matched_peers_count"]
+            "killed": len(killed_ports),
+            "matched": matched,
+            "holders_left": total_holders,  # always constant
+            "keyword": keyword,
+            "source_id": source_id,
+            "source_port": source_port,
+            "ttl": 5,
+            "kill_list": kill_list[:20],
+            "killed_ids": sorted(killed_ids),
+            **debug,
         })
-        print(f"Killed {len(killed):2d} nodes: matched={metrics['matched_peers_count']}")
+        coverage = matched / max(total_holders, 1) * 100
+        print(f"  Killed {len(killed_ports):2d} hubs: "
+              f"matched={matched}/{total_holders} ({coverage:.1f}%), "
+              f"reachable={debug['reachable_holders']}, "
+              f"source_neighbors={debug['source_alive_neighbors']}, "
+              f"component={debug['source_component_size']}")
+        if matched > debug["reachable_holders"]:
+            print("  WARNING: matched exceeds graph-reachable holders; "
+                  "runtime state may still be stale.")
+
+    # Assert holders_left never changed
+    assert all(r.get("holders_left", r.get("remaining_holders", 0)) == total_holders
+               for r in results), \
+        "BUG: holders_left changed - a keyword-holder was killed!"
 
     return results
 
 
-def save_failure_report(results, killed_ids):
+def save_failure_report(results):
     os.makedirs("results", exist_ok=True)
     with open("results/failure_report.txt", "w") as f:
-        f.write("Failure Demo Report\n")
+        f.write("Failure Demo Report - Hub Attack\n")
         f.write("-" * 50 + "\n")
-        f.write(f"Killed nodes: {sorted(killed_ids)}\n\n")
-        f.write("Step-by-step results:\n")
+        f.write("Killing high-degree hub nodes (non-holders), "
+                "holders_left stays constant.\n\n")
+        if results:
+            first = results[0]
+            f.write(f"Keyword:      {first.get('keyword', '?')}\n")
+            f.write(f"Source peer:  {first.get('source_id', '?')}\n")
+            f.write(f"TTL:          {first.get('ttl', '?')}\n")
+            f.write(f"Kill list:    {first.get('kill_list', [])}\n\n")
+
         for r in results:
+            holders = r.get("holders_left", r.get("remaining_holders", "?"))
             f.write(
-                f"  Killed={r['killed']:2d}: matched_peers_count={r['matched']}\n"
+                f"  Killed={r['killed']:2d}: matched={r['matched']}"
+                f"/{holders}, reachable_holders="
+                f"{r.get('reachable_holders', '?')}, "
+                f"source_alive_neighbors="
+                f"{r.get('source_alive_neighbors', '?')}, "
+                f"source_component_size="
+                f"{r.get('source_component_size', '?')}\n"
             )
+            if r.get("matched", 0) > r.get("reachable_holders", 10**9):
+                f.write("    WARNING: matched exceeds graph-reachable holders.\n")
         f.write("\nExplanation:\n")
         f.write(
-            "After high-degree nodes leave, the overlay loses important "
-            "routing paths.\n"
-            "Peers detect failed neighbors via heartbeat and stop forwarding "
-            "messages to them.\n"
-            "Search still works if the remaining overlay is connected, "
-            "but coverage decreases.\n"
+            "Killing high-degree hub nodes fragments the overlay, making it "
+            "harder for queries to reach keyword-holders.\n"
+            "File copies still exist (holders_left is constant), but the "
+            "TTL-limited flood can no longer reach them all.\n"
+            "Coverage decreases as more hubs are removed.\n"
         )
     print("Saved: results/failure_report.txt")
 
@@ -803,26 +1058,36 @@ async def main():
 
     # ---- Failure experiment ----
     print("\nRunning failure experiment...")
-    adj = build_adjacency(topology)
-    degrees = sorted(range(100), key=lambda i: len(adj[i]), reverse=True)
-    high_degree_ids = degrees[:20]
     failure_results = await run_failure_experiment(topology)
-    if HAVE_MPL:
-        plot_failure_case(failure_results)
-    save_failure_report(failure_results, high_degree_ids)
+    if failure_results:
+        if HAVE_MPL:
+            plot_failure_case(failure_results)
+        save_failure_report(failure_results)
+    else:
+        print("  [Skipped failure report/chart - experiment was aborted.]")
 
     print("\nAll experiments complete. Results saved in results/")
 
 
 if __name__ == "__main__":
-    # Only restart peers if none are currently running (to avoid TIME_WAIT on Windows)
     async def _ensure_peers():
         topo = json.load(open("topology.json"))
-        for p in topo["peers"][:3]:
-            if await send_message(p["port"], {"type": "PING"}):
-                print("Peers already running — no restart needed.")
-                return
-        print("No peers detected — starting fresh...")
+        ports = [p["port"] for p in topo["peers"]]
+        sem = asyncio.Semaphore(20)
+
+        async def _check(p):
+            async with sem:
+                return await send_message(p, {"type": "PING"}, connect_timeout=1.0)
+
+        results = await asyncio.gather(*[_check(p) for p in ports])
+        alive = sum(1 for r in results if r)
+        if alive == len(ports):
+            print(f"All {alive}/{len(ports)} peers running - good.")
+            return
+        elif alive > 0:
+            print(f"Only {alive}/{len(ports)} peers running - restarting...")
+        else:
+            print("No peers detected - starting fresh...")
         await restart_all_peers()
 
     asyncio.run(_ensure_peers())

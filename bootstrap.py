@@ -83,7 +83,7 @@ def main():
     print("Generating peers...")
     peers = generate_peers(n)
     print("Generating topology...")
-    edges = generate_topology(n)
+    edges = generate_topology(n, extra_edges=40)
     print("Assigning files...")
     files = assign_files(n)
 
