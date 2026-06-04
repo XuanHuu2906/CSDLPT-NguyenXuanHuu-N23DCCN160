@@ -1,26 +1,26 @@
-# Byte-compiled / optimized / DLL files
+# File mã byte / tối ưu hóa / DLL
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Virtual environments
+# Môi trường ảo
 .venv/
 venv/
 ENV/
 env/
 .env
 
-# Project specific generated files (dynamically bootstrapped or created during experiments)
+# File sinh riêng cho dự án (tạo khi bootstrap hoặc chạy thí nghiệm)
 topology.json
 logs/
 results/
 
-# Editor and IDE configurations
+# Cấu hình trình soạn thảo và IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# OS specific files
+# File riêng của hệ điều hành
 .DS_Store
 Thumbs.db

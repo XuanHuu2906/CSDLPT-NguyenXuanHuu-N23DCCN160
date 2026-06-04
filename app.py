@@ -3,6 +3,7 @@ import json
 import os
 import queue
 import random
+import stat
 import statistics as st
 import subprocess
 import sys
@@ -19,7 +20,7 @@ from analysis import (count_peers_with_file, get_file_pool,
                       compute_statistics, TTLS, RUNS_PER_TTL,
                       peer_id_from_port, build_adjacency)
 
-BLOCKED_PEERS = set()  # No blocked peers with port range 6000-6099
+BLOCKED_PEERS = set()  # Không chặn peer nào trong dải port 6000-6099
 
 app = flask.Flask(__name__)
 
@@ -35,7 +36,7 @@ def _get_topology():
 
 
 # =====================================================================
-# Routes
+# Route HTTP
 # =====================================================================
 
 @app.route("/")
@@ -52,10 +53,10 @@ def peer_status():
     async def _check():
         results = {}
 
-        # Single shared server for all 100 peer checks - avoids
-        # Python 3.13 ProactorEventLoop assertion when closing
-        # 100 temporary servers in rapid succession.
-        current_waiter = {}  # shared mutable: {"event": Event, "data": {}}
+        # Một server dùng chung cho cả 100 lần kiểm tra peer - tránh
+        # assertion của Python 3.13 ProactorEventLoop khi đóng
+        # nhanh 100 server tạm liên tiếp.
+        current_waiter = {}  # dict chia sẻ có thể thay đổi: {"event": Event, "data": {}}
 
         async def collect(reader, writer):
             try:
@@ -93,6 +94,12 @@ def peer_status():
                     "matched_peers_count": 0,
                     "failed_forward_count": 0,
                     "dead_neighbors_detected": 0,
+                    "isolated": False,
+                    "alive_neighbors_count": 0,
+                    "neighbor_count": 0,
+                    "runtime_neighbors_count": 0,
+                    "rejoin_attempts": 0,
+                    "rejoin_success_count": 0,
                     "file_count": file_count.get(str(i), 0),
                     "blocked": i in BLOCKED_PEERS,
                 }
@@ -121,6 +128,12 @@ def peer_status():
                         info["matched_peers_count"] = received_data.get("matched_peers_count", 0)
                         info["failed_forward_count"] = received_data.get("failed_forward_count", 0)
                         info["dead_neighbors_detected"] = received_data.get("dead_neighbors_detected", 0)
+                        info["isolated"] = received_data.get("isolated", False)
+                        info["alive_neighbors_count"] = received_data.get("alive_neighbors_count", 0)
+                        info["neighbor_count"] = received_data.get("neighbor_count", 0)
+                        info["runtime_neighbors_count"] = received_data.get("runtime_neighbors_count", 0)
+                        info["rejoin_attempts"] = received_data.get("rejoin_attempts", 0)
+                        info["rejoin_success_count"] = received_data.get("rejoin_success_count", 0)
                     except asyncio.TimeoutError:
                         pass
 
@@ -153,9 +166,9 @@ def revive_peers():
             )
             writer.close()
             await writer.wait_closed()
-            return True  # online
+            return True  # Online
         except Exception:
-            return False  # offline
+            return False  # Offline
 
     async def _scan():
         results = []
@@ -183,7 +196,7 @@ def revive_peers():
 
     if revived:
         import time as _time
-        _time.sleep(0.3)  # brief wait for processes to bind
+        _time.sleep(0.3)  # Chờ ngắn để process bind port
 
     return flask.jsonify({"revived": revived, "count": len(revived)})
 
@@ -231,6 +244,13 @@ def run_query():
         "avg_latency_ms": round(avg_lat, 1),
         "failed_forward_count": metrics.get("failed_forward_count", 0),
         "dead_neighbors_detected": metrics.get("dead_neighbors_detected", 0),
+        "isolated_nodes_count": metrics.get("isolated_nodes_count", 0),
+        "source_isolated": metrics.get("source_isolated", False),
+        "source_alive_neighbors_count": metrics.get(
+            "source_alive_neighbors_count", 0
+        ),
+        "rejoin_attempts": metrics.get("rejoin_attempts", 0),
+        "rejoin_success_count": metrics.get("rejoin_success_count", 0),
         "source_id": source_id,
         "keyword": keyword,
         "ttl": ttl,
@@ -238,7 +258,7 @@ def run_query():
 
 
 # =====================================================================
-# SSE / Background Analysis
+# SSE / Phân tích chạy nền
 # =====================================================================
 
 def _emit(event, data=None):
@@ -248,6 +268,27 @@ def _emit(event, data=None):
             q.put_nowait(msg)
         except queue.Full:
             pass
+
+
+def _safe_remove_file(path, label=None, retries=5, delay=0.2):
+    """Remove a result file without aborting if Windows still has it locked."""
+    for attempt in range(retries):
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except PermissionError:
+            try:
+                os.chmod(path, stat.S_IWRITE)
+            except OSError:
+                pass
+            if attempt < retries - 1:
+                time.sleep(delay)
+                continue
+            name = label or os.path.basename(path)
+            _emit("log", f"WARNING: could not remove locked file: {name}")
+            return False
 
 
 def _run_analysis_background():
@@ -261,7 +302,7 @@ def _run_analysis_background():
         os.makedirs("results", exist_ok=True)
         for f in os.listdir("results"):
             if f.endswith((".csv", ".png", ".txt")):
-                os.remove(os.path.join("results", f))
+                _safe_remove_file(os.path.join("results", f), f)
 
         _emit("log", "Loading topology...")
         topology = _get_topology()
@@ -287,7 +328,7 @@ def _run_analysis_background():
         n_runs = RUNS_PER_TTL
         all_results = []
 
-        # Pre-generate test cases so each case runs all TTLs with same source/keyword
+        # Sinh trước test case để mỗi case chạy mọi TTL với cùng source/keyword
         random.seed(42)
         pool = get_file_pool(topology)
         valid_sources = [i for i in range(100) if i not in BLOCKED_PEERS]
@@ -304,9 +345,8 @@ def _run_analysis_background():
                 "total_with_file": total_with_file,
             })
 
-        # Single event loop for the entire experiment phase - avoids
-        # ProactorEventLoop resource exhaustion from creating/destroying
-        # 30 loops (10 cases x 3 TTLs) on Windows.
+        # Dùng một vòng lặp sự kiện cho toàn bộ pha thí nghiệm - tránh cạn tài nguyên
+        # ProactorEventLoop do tạo/hủy 30 loop (10 case x 3 TTL) trên Windows.
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -376,8 +416,8 @@ def _run_analysis_background():
                         f"hops={avg_hops:.1f} lat={avg_lat:.1f}ms"
                     )
 
-                    # Drain between TTL iterations: let the network settle
-                    # before RESET + next query (avoids stale-state bleed).
+                    # Xả giữa các lượt TTL: cho mạng ổn định
+                    # trước RESET + query kế tiếp (tránh rò state cũ).
                     if ttl != ttl_values[-1]:
                         loop.run_until_complete(asyncio.sleep(1.0))
         finally:
@@ -389,7 +429,7 @@ def _run_analysis_background():
 
         _emit("stats", _serialize_stats(stats))
 
-        # Charts
+        # Biểu đồ
         try:
             import matplotlib
             matplotlib.use("Agg")
@@ -420,7 +460,7 @@ def _run_analysis_background():
             save_topology_graph(topology)
             save_topology_stats(topology)
 
-            # Query propagation: use first test case for all TTLs
+            # Lan truyền query: dùng test case đầu cho mọi TTL
             first_case_results = [r for r in all_results if r["run"] == 0]
             if first_case_results:
                 sample = first_case_results[0]
@@ -435,7 +475,7 @@ def _run_analysis_background():
                         str(ttl)
                     )
 
-            # Save CSV
+            # Lưu CSV
             save_csv(all_results)
             save_summary_csv(stats)
 
@@ -448,7 +488,7 @@ def _run_analysis_background():
             for ttl in ttl_values:
                 charts.append(f"query_path_ttl_{ttl}.png")
 
-            # Only emit charts that actually exist on disk
+            # Chỉ emit các biểu đồ thật sự tồn tại trên ổ đĩa
             charts = [name for name in charts if os.path.exists(f"results/{name}")]
             expected_main = [
                 "chart_coverage_vs_overhead.png",
@@ -478,7 +518,7 @@ def _run_analysis_background():
 
 
 def _serialize_stats(stats):
-    """Convert stats to JSON-serializable plain dicts."""
+    """Chuyển stats thành dict thuần có thể JSON-serialize."""
     out = {}
     for ttl, s in stats.items():
         entry = {}
@@ -492,7 +532,7 @@ def _serialize_stats(stats):
 
 
 def _scan_chart_files():
-    """Return list of chart filenames that exist in results/."""
+    """Trả về danh sách tên file biểu đồ đang tồn tại trong results/."""
     if not os.path.isdir("results"):
         return []
     standard = [
@@ -575,7 +615,7 @@ def run_failure():
         chart_generated = False
         chart_path = os.path.join("results", "chart_failure_case.png")
         if os.path.exists(chart_path):
-            os.remove(chart_path)
+            _safe_remove_file(chart_path, "chart_failure_case.png")
         if not results:
             return {
                 "ok": False,

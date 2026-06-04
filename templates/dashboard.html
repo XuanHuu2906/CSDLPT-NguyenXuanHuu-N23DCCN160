@@ -283,7 +283,8 @@
           <thead>
             <tr>
               <th>ID</th><th>Port</th><th>Status</th><th>Files</th>
-              <th>Sent</th><th>Dropped</th><th>Matched</th>
+              <th>Alive Nbr</th><th>Sent</th><th>Dropped</th><th>Matched</th>
+              <th>Rejoin</th>
             </tr>
           </thead>
           <tbody id="peer-body"></tbody>
@@ -392,6 +393,13 @@
               <th>Reachable Holders</th>
               <th>Source Neighbors</th>
               <th>Source Component</th>
+              <th>Graph Isolated</th>
+              <th>Check</th>
+              <th>Detected</th>
+              <th>Connected</th>
+              <th>Still</th>
+              <th>Runtime Isolated</th>
+              <th>Recovered</th>
               <th>Coverage Change</th>
             </tr>
           </thead>
@@ -473,16 +481,20 @@ function renderPeers() {
     const p = peerData[id];
     if (p.blocked) continue;
     p.online ? online++ : offline++;
+    const statusText = p.online ? (p.isolated ? "ISOLATED" : "ONLINE") : "OFFLINE";
+    const statusClass = p.online && !p.isolated ? "online" : "offline";
 
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${p.peer_id}</td>
       <td>${p.port}</td>
-      <td class="${p.online ? 'online' : 'offline'}">${p.online ? 'ONLINE' : 'OFFLINE'}</td>
+      <td class="${statusClass}">${statusText}</td>
       <td>${p.file_count}</td>
+      <td>${p.alive_neighbors_count ?? 0}/${p.neighbor_count ?? 0}</td>
       <td>${p.messages_sent}</td>
       <td>${p.duplicate_queries_dropped}</td>
       <td>${p.matched_peers_count}</td>
+      <td>${p.rejoin_success_count ?? 0}/${p.rejoin_attempts ?? 0}</td>
     `;
     tbody.appendChild(tr);
   }
@@ -576,7 +588,9 @@ document.getElementById("query-form").addEventListener("submit", async function(
     document.getElementById("qr-dropped").textContent = data.duplicate_queries_dropped;
     document.getElementById("qr-ratio").textContent = data.duplicate_ratio;
     document.getElementById("qr-meta").textContent =
-      `Source: Peer ${data.source_id}  -  Keyword: "${data.keyword}"  -  TTL: ${data.ttl}`;
+      `Source: Peer ${data.source_id}  -  Keyword: "${data.keyword}"  -  TTL: ${data.ttl}` +
+      `  -  Source isolated: ${data.source_isolated ? "yes" : "no"}` +
+      `  -  Rejoin: ${data.rejoin_success_count}/${data.rejoin_attempts}`;
     document.getElementById("query-result").classList.add("show");
   } catch(e) {
     alert("Query failed: " + e.message);
@@ -727,6 +741,13 @@ async function runFailureDemo() {
         <td>${row.reachable_holders ?? "-"}</td>
         <td>${row.source_alive_neighbors ?? "-"}</td>
         <td>${row.source_component_size ?? "-"}</td>
+        <td>${row.graph_isolated_nodes_count ?? 0}</td>
+        <td>${row.isolation_check_completed ?? row.isolation_check_delivered ?? 0}/${row.isolation_check_targeted ?? 0}</td>
+        <td>${row.isolation_check_detected ?? 0}</td>
+        <td>${row.isolation_check_connected ?? 0}</td>
+        <td>${row.isolation_check_still_isolated ?? 0}</td>
+        <td>${row.isolated_nodes_count ?? 0}</td>
+        <td>${row.isolation_check_recovered ?? 0}/${row.isolation_check_rejoin_needed ?? 0}</td>
         <td style="color:${changeColor};font-weight:600">${changeStr}&nbsp;(${pct}%)</td>
       `;
       tbody.appendChild(tr);

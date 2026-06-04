@@ -16,7 +16,7 @@ echo "=== Starting dashboard ==="
 echo "Open http://localhost:5500 in your browser"
 echo "Press Ctrl+C to stop"
 
-# Trap to cleanup peers on exit
+# Trap để dọn peer khi thoát
 cleanup() {
     echo ""
     echo "=== Cleaning up peers ==="

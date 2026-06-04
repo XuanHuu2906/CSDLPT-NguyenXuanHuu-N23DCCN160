@@ -7,53 +7,70 @@ import uuid
 
 HEARTBEAT_INTERVAL = 15
 PONG_TIMEOUT = 2.0
+REJOIN_COOLDOWN = 10.0
+REJOIN_MAX_CANDIDATES = 12
+REJOIN_NEIGHBOR_TARGET = 3
+REJOIN_RESPONSE_TIMEOUT = 1.5
 
 
 class P2PNode:
-    def __init__(self, peer_id, port, neighbors, local_files):
+    def __init__(self, peer_id, port, neighbors, local_files, known_ports=None):
         self.peer_id = peer_id
         self.port = port
-        self.neighbors = neighbors
+        self.neighbors = list(dict.fromkeys(neighbors))
+        self.static_neighbors = set(self.neighbors)
+        self.known_ports = list(dict.fromkeys(known_ports or []))
+        if self.port not in self.known_ports:
+            self.known_ports.append(self.port)
         self.local_files = local_files
 
-        # --- QUERY state ---
+        # --- Trạng thái QUERY ---
         self.seen_queries = set()
         self.query_route_table = {}
         self.query_alternate_routes = {}
         self.processed_queryhits = set()
-        self.current_query_id = None   # origin-only: guards against stale QUERYHITs
+        self.current_query_id = None   # Chỉ node gốc dùng: chặn QUERYHIT cũ
 
-        # --- Churn / dead-neighbor detection ---
+        # --- Phát hiện node rời mạng / neighbor chết ---
         self.dead_neighbors = set()
         self.failed_forward_count = 0
         self.last_seen = {}         # neighbor_port -> timestamp
 
-        # --- Metrics (origin) ---
+        self.isolated = False
+        self.isolated_since = None
+        self.alive_neighbors_count = len(self.neighbors)
+        self.runtime_neighbors = set()
+        self.rejoin_attempts = 0
+        self.rejoin_success_count = 0
+        self.rejoin_in_progress = False
+        self.last_rejoin_attempt = 0.0
+
+        # --- Metrics (node gốc) ---
         self.matched_peer_ports = set()
         self.matched_peers_count = 0
         self.queryhit_count = 0
         self.duplicate_queryhits_dropped = 0
-        self.latencies = []         # ms per QUERYHIT (at origin)
-        self.hops = []              # hop count per QUERYHIT (at origin)
-        self.fallback_used = 0      # count of QUERYHITs delivered via alternate route
+        self.latencies = []         # ms cho mỗi QUERYHIT (tại node gốc)
+        self.hops = []              # số hop cho mỗi QUERYHIT (tại node gốc)
+        self.fallback_used = 0      # số QUERYHIT đi qua route thay thế
 
-        # --- Metrics (global) ---
+        # --- Metrics (toàn cục) ---
         self.messages_sent = 0
         self.duplicate_queries_dropped = 0
 
-        # --- Latency measurement ---
+        # --- Đo latency ---
         self.query_start_time = {}  # query_id -> perf_counter()
 
-        # --- Control ---
+        # --- Điều khiển ---
         self.shutdown_event = asyncio.Event()
         self.last_reset_time = time.time()
 
-        # --- Persistent outbound connections (one per neighbor) ---
+        # --- Kết nối gửi ra duy trì lâu dài (mỗi neighbor một kết nối) ---
         self.out_writers = {}       # neighbor_port -> (StreamWriter, StreamReader)
-        self.in_writers = set()     # active inbound StreamWriter objects
+        self.in_writers = set()     # các StreamWriter nhận vào đang hoạt động
 
     # -----------------------------------------------------------------
-    # Lifecycle
+    # Vòng đời
     # -----------------------------------------------------------------
     async def start(self):
         server = await asyncio.start_server(
@@ -68,11 +85,11 @@ class P2PNode:
 
         await self.shutdown_event.wait()
 
-        # Cancel heartbeat and close outbound writers BEFORE
-        # server.wait_closed().  Persistent outbound connections keep
-        # neighbours' inbound handlers alive (blocked on readline()).
-        # Without closing them first, server.wait_closed() deadlocks
-        # because every peer waits for its neighbours to close first.
+        # Hủy heartbeat và đóng writer gửi ra TRƯỚC
+        # server.wait_closed(). Kết nối gửi ra duy trì lâu dài giữ handler
+        # nhận vào của neighbor còn sống (kẹt ở readline()).
+        # Nếu không đóng trước, server.wait_closed() có thể deadlock
+        # vì mỗi peer chờ neighbor đóng trước.
         heartbeat_task.cancel()
         try:
             await heartbeat_task
@@ -90,10 +107,10 @@ class P2PNode:
         print(f"[Peer {self.port}] Stopped.")
 
     # -----------------------------------------------------------------
-    # Connection / message dispatch
+    # Kết nối / điều phối message
     # -----------------------------------------------------------------
     async def handle_connection(self, reader, writer):
-        """Read JSON-line messages until the peer disconnects (EOF)."""
+        """Đọc message JSON-line cho tới khi peer ngắt kết nối (EOF)."""
         peer_addr = writer.get_extra_info('peername')
         self.in_writers.add(writer)
         try:
@@ -109,11 +126,10 @@ class P2PNode:
                 msg_type = message.get("type")
 
                 if msg_type == "PING":
-                    # Neighbour heartbeat: the sender's send_message success
-                    # already confirms liveness.  No PONG is needed - writing
-                    # one would accumulate in the persistent connection's
-                    # receive buffer (which nobody drains), causing TCP
-                    # backpressure and eventual connection stall.
+                    # Heartbeat của neighbor: send_message thành công từ sender
+                    # đã xác nhận liveness. Không cần PONG vì ghi PONG sẽ tích
+                    # tụ trong receive buffer của kết nối persistent (không ai
+                    # drain), gây backpressure TCP và cuối cùng làm kẹt kết nối.
                     pass
                 else:
                     try:
@@ -138,6 +154,10 @@ class P2PNode:
             await self.handle_queryhit(message)
         elif msg_type == "METRICS_REQUEST":
             await self.handle_metrics_request(message)
+        elif msg_type == "REJOIN_REQUEST":
+            await self.handle_rejoin_request(message)
+        elif msg_type == "CHECK_ISOLATION":
+            await self.handle_check_isolation(message)
         elif msg_type == "RESET":
             self.reset_state()
         elif msg_type == "SHUTDOWN":
@@ -145,14 +165,14 @@ class P2PNode:
             self.shutdown_event.set()
 
     # -----------------------------------------------------------------
-    # PING / PONG heartbeat
+    # Heartbeat PING / PONG
     # -----------------------------------------------------------------
     async def ping_neighbor(self, neighbor_port):
-        """Returns True if neighbor responds with PONG within timeout.
+        """Trả về True nếu neighbor phản hồi trong timeout.
 
-        Uses persistent connection via send_message to avoid ephemeral
-        port exhaustion on Windows (TIME_WAIT accumulates when opening
-        a fresh TCP connection every 5 seconds per neighbour).
+        Dùng kết nối persistent qua send_message để tránh cạn ephemeral
+        port trên Windows (TIME_WAIT tích tụ khi mở kết nối TCP mới
+        mỗi 5 giây cho từng neighbor).
         """
         try:
             msg = {"type": "PING", "sender_port": self.port}
@@ -161,7 +181,7 @@ class P2PNode:
             return False
 
     async def heartbeat_loop(self):
-        """Periodically PING all neighbors to detect dead nodes."""
+        """PING định kỳ toàn bộ neighbor để phát hiện node chết."""
         while not self.shutdown_event.is_set():
             for nb in list(self.neighbors):
                 alive = await self.ping_neighbor(nb)
@@ -169,7 +189,7 @@ class P2PNode:
                 if alive:
                     self.last_seen[nb] = now
                     if nb in self.dead_neighbors:
-                        # revived
+                        # Đã sống lại
                         print(
                             f"[Peer {self.port}] Neighbor {nb} is alive again. "
                             f"Removed from dead list."
@@ -184,10 +204,252 @@ class P2PNode:
                                 f"[Peer {self.port}] Neighbor {nb} failed heartbeat. "
                                 f"Marked as dead."
                             )
+            self.update_isolation_state()
+            if self.isolated:
+                await self.attempt_rejoin()
             await asyncio.sleep(HEARTBEAT_INTERVAL)
 
+    async def handle_check_isolation(self, message):
+        """Actively verify all neighbors now, then rejoin if isolated."""
+        reply_port = message.get("reply_port")
+        request_id = message.get("request_id")
+
+        isolated_before = self.isolated
+        rejoin_attempts_before = self.rejoin_attempts
+        rejoin_success_before = self.rejoin_success_count
+
+        await self.refresh_neighbor_liveness()
+        isolated_after_scan = self.isolated
+        if self.isolated:
+            await self.attempt_rejoin()
+        self.update_isolation_state()
+
+        if reply_port is not None:
+            response = {
+                "type": "CHECK_ISOLATION_RESPONSE",
+                "request_id": request_id,
+                "peer_id": self.peer_id,
+                "port": self.port,
+                "isolated_before": isolated_before,
+                "isolated_after_scan": isolated_after_scan,
+                "isolated_after_rejoin": self.isolated,
+                "alive_neighbors_count": self.alive_neighbors_count,
+                "neighbor_count": len(self.neighbors),
+                "runtime_neighbors_count": len(self.runtime_neighbors),
+                "rejoin_attempted": (
+                    self.rejoin_attempts - rejoin_attempts_before
+                ),
+                "rejoin_succeeded": (
+                    self.rejoin_success_count - rejoin_success_before
+                ),
+                "rejoin_attempts": self.rejoin_attempts,
+                "rejoin_success_count": self.rejoin_success_count,
+                "dead_neighbors_detected": len(self.dead_neighbors),
+            }
+            await self.send_message(int(reply_port), response)
+
+    async def refresh_neighbor_liveness(self):
+        neighbors = list(self.neighbors)
+        sem = asyncio.Semaphore(10)
+
+        async def _ping_one(nb):
+            async with sem:
+                return nb, await self.ping_neighbor(nb)
+
+        results = await asyncio.gather(*[_ping_one(nb) for nb in neighbors])
+        now = time.time()
+        for nb, alive in results:
+            if alive:
+                self.last_seen[nb] = now
+                self.dead_neighbors.discard(nb)
+            else:
+                if nb not in self.dead_neighbors:
+                    print(
+                        f"[Peer {self.port}] Neighbor {nb} failed active "
+                        "isolation check. Marked as dead."
+                    )
+                self.dead_neighbors.add(nb)
+
+        self.update_isolation_state()
+        return not self.isolated
+
+    def alive_neighbors(self):
+        return [nb for nb in self.neighbors if nb not in self.dead_neighbors]
+
+    def update_isolation_state(self):
+        self.alive_neighbors_count = len(self.alive_neighbors())
+        now = time.time()
+        if self.alive_neighbors_count == 0:
+            if not self.isolated:
+                self.isolated = True
+                self.isolated_since = now
+                print(
+                    f"[Peer {self.port}] Isolated: no alive neighbors "
+                    f"(known={len(self.neighbors)})"
+                )
+        else:
+            if self.isolated:
+                print(
+                    f"[Peer {self.port}] Reconnected: "
+                    f"{self.alive_neighbors_count} alive neighbor(s)"
+                )
+            self.isolated = False
+            self.isolated_since = None
+        return self.isolated
+
+    def add_runtime_neighbor(self, port):
+        if port == self.port:
+            return False
+        added = False
+        if port not in self.neighbors:
+            self.neighbors.append(port)
+            added = True
+        if port not in self.static_neighbors:
+            self.runtime_neighbors.add(port)
+        self.dead_neighbors.discard(port)
+        self.last_seen[port] = time.time()
+        return added
+
+    def choose_rejoin_candidates(self):
+        non_neighbors = [
+            p for p in self.known_ports
+            if p != self.port and p not in self.neighbors
+        ]
+        candidates = [p for p in non_neighbors if p not in self.dead_neighbors]
+        if not candidates:
+            candidates = [
+                p for p in self.known_ports
+                if p != self.port and p not in self.dead_neighbors
+            ]
+        if not candidates:
+            candidates = [p for p in self.known_ports if p != self.port]
+        random.shuffle(candidates)
+        return candidates[:REJOIN_MAX_CANDIDATES]
+
+    async def attempt_rejoin(self):
+        now = time.time()
+        if self.rejoin_in_progress:
+            return False
+        if now - self.last_rejoin_attempt < REJOIN_COOLDOWN:
+            return False
+
+        candidates = self.choose_rejoin_candidates()
+        if not candidates:
+            return False
+
+        self.rejoin_attempts += 1
+        self.last_rejoin_attempt = now
+        self.rejoin_in_progress = True
+
+        response = {}
+        received = asyncio.Event()
+        expected = {"request_id": None}
+
+        async def receive_rejoin_response(reader, writer):
+            try:
+                data = await asyncio.wait_for(
+                    reader.readline(), timeout=REJOIN_RESPONSE_TIMEOUT
+                )
+                msg = json.loads(data.decode().strip())
+                if (msg.get("type") == "REJOIN_RESPONSE"
+                        and msg.get("request_id") == expected["request_id"]):
+                    response.clear()
+                    response.update(msg)
+                    received.set()
+            except Exception:
+                pass
+            finally:
+                writer.close()
+
+        server = await asyncio.start_server(receive_rejoin_response, '127.0.0.1', 0)
+        reply_port = server.sockets[0].getsockname()[1]
+
+        try:
+            print(
+                f"[Peer {self.port}] Rejoin attempt "
+                f"{self.rejoin_attempts}: trying {len(candidates)} candidate(s)"
+            )
+            for candidate in candidates:
+                request_id = str(uuid.uuid4())
+                expected["request_id"] = request_id
+                response.clear()
+                received.clear()
+
+                request = {
+                    "type": "REJOIN_REQUEST",
+                    "request_id": request_id,
+                    "peer_id": self.peer_id,
+                    "port": self.port,
+                    "reply_port": reply_port,
+                }
+                ok = await self.send_message(candidate, request)
+                if not ok:
+                    continue
+
+                try:
+                    await asyncio.wait_for(
+                        received.wait(), timeout=REJOIN_RESPONSE_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                suggested = response.get("neighbors", [])
+                added = []
+                for nb in suggested:
+                    try:
+                        nb = int(nb)
+                    except (TypeError, ValueError):
+                        continue
+                    if nb == self.port:
+                        continue
+                    if await self.ping_neighbor(nb):
+                        self.add_runtime_neighbor(nb)
+                        added.append(nb)
+
+                if added:
+                    self.rejoin_success_count += 1
+                    self.update_isolation_state()
+                    print(
+                        f"[Peer {self.port}] Rejoin success via {candidate}: "
+                        f"neighbors={added}"
+                    )
+                    return True
+
+            print(f"[Peer {self.port}] Rejoin failed: no reachable candidates")
+            return False
+        finally:
+            server.close()
+            try:
+                await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+            except (Exception, AssertionError):
+                pass
+            self.rejoin_in_progress = False
+
+    async def handle_rejoin_request(self, message):
+        requester_port = int(message["port"])
+        reply_port = message.get("reply_port")
+        request_id = message.get("request_id")
+
+        if requester_port != self.port:
+            self.add_runtime_neighbor(requester_port)
+            self.update_isolation_state()
+
+        alive = [nb for nb in self.alive_neighbors() if nb != requester_port]
+        random.shuffle(alive)
+        suggested = [self.port]
+        suggested.extend(alive[:max(0, REJOIN_NEIGHBOR_TARGET - 1)])
+
+        if reply_port is not None:
+            response = {
+                "type": "REJOIN_RESPONSE",
+                "request_id": request_id,
+                "sender_port": self.port,
+                "neighbors": suggested,
+            }
+            await self.send_message(int(reply_port), response)
+
     # -----------------------------------------------------------------
-    # QUERY handling (flooding)
+    # Xử lý QUERY (flooding)
     # -----------------------------------------------------------------
     async def handle_query(self, message):
         query_id = message["query_id"]
@@ -199,7 +461,7 @@ class P2PNode:
 
         short_qid = query_id.split("-")[0]
 
-        # --- Origin self-clearing: each new own-query resets origin state ---
+        # --- Node gốc tự dọn: mỗi query do nó khởi tạo sẽ reset state của node gốc ---
         if self.port == origin_port and query_id != self.current_query_id:
             self.current_query_id = query_id
             self.matched_peer_ports.clear()
@@ -210,9 +472,8 @@ class P2PNode:
             self.hops.clear()
             self.fallback_used = 0
             self.query_start_time.clear()
-            # Revive all neighbors for the new query (stale dead_neighbors
-            # from a failed RESET would block forwarding and cause TTL
-            # monotonicity violations).
+            # Khôi phục toàn bộ neighbor cho query mới (dead_neighbors cũ
+            # do RESET lỗi có thể chặn chuyển tiếp và làm TTL không đơn điệu).
             if self.dead_neighbors:
                 print(
                     f"[Peer {self.port}] Clearing {len(self.dead_neighbors)} "
@@ -220,12 +481,12 @@ class P2PNode:
                 )
                 self.dead_neighbors.clear()
 
-        # Duplicate suppression - still drop, but save alternate route
+        # Chặn duplicate - vẫn bỏ qua, nhưng lưu route thay thế
         if query_id in self.seen_queries:
             self.duplicate_queries_dropped += 1
             primary = self.query_route_table.get(query_id)
-            # Only save alternate route if the sender is not us and
-            # we are NOT already in the query's path (would create a loop).
+            # Chỉ lưu route thay thế nếu sender không phải chính mình và
+            # ta CHƯA nằm trong path của query (nếu có sẽ tạo vòng lặp).
             if (sender_port != primary
                     and sender_port != self.port
                     and self.port not in current_path):
@@ -244,11 +505,11 @@ class P2PNode:
             f"ttl={ttl} from={sender_port} keyword={keyword}"
         )
 
-        # Record start time at origin
+        # Ghi nhận thời điểm bắt đầu tại node gốc
         if self.port == origin_port and query_id not in self.query_start_time:
             self.query_start_time[query_id] = time.perf_counter()
 
-        # Check local files
+        # Kiểm tra file cục bộ
         matched_files = [f for f in self.local_files if keyword in f]
         for file in matched_files:
             hop_count = len(current_path)
@@ -269,7 +530,7 @@ class P2PNode:
                     f"hops={hop_count}"
                 )
 
-        # Forward if TTL > 0
+        # Chuyển tiếp nếu TTL > 0
         if ttl > 0:
             new_path = list(current_path) + [self.port]
             forward_msg = {
@@ -282,10 +543,10 @@ class P2PNode:
                 "sender_port": self.port,
                 "path": new_path
             }
-            # Forward to all non-sender neighbors concurrently.
-            # Dead-marked neighbors are NOT skipped - the dead mark is often
-            # from a transient error.  Semaphore provides backpressure so
-            # the outbound write burst doesn't overwhelm the event loop.
+            # Chuyển tiếp đồng thời tới toàn bộ neighbor không phải sender.
+            # Neighbor bị đánh dấu dead KHÔNG bị bỏ qua vì dấu dead thường
+            # đến từ lỗi tạm thời. Semaphore tạo backpressure để burst ghi
+            # gửi ra không làm quá tải event loop.
             alive = [nb for nb in self.neighbors
                      if nb != sender_port and nb not in self.dead_neighbors]
             dead_candidates = [nb for nb in self.neighbors
@@ -294,8 +555,8 @@ class P2PNode:
             fwd_sem = asyncio.Semaphore(10)
 
             async def _forward_one(nb):
-                # Small random jitter spreads connection attempts across
-                # peers, reducing synchronised bursts that trigger WinError 52.
+                # Jitter ngẫu nhiên nhỏ giúp phân tán lượt kết nối giữa
+                # các peer, giảm burst đồng bộ gây WinError 52.
                 await asyncio.sleep(random.uniform(0, 0.002))
                 async with fwd_sem:
                     return await self.send_message(nb, forward_msg)
@@ -303,14 +564,19 @@ class P2PNode:
             results = await asyncio.gather(
                 *[_forward_one(nb) for nb in alive + dead_candidates]
             )
+            sent_ok = 0
             for ok in results:
                 if ok:
+                    sent_ok += 1
                     self.messages_sent += 1
                 else:
                     self.failed_forward_count += 1
+            self.update_isolation_state()
+            if sent_ok == 0 and self.isolated:
+                asyncio.create_task(self.attempt_rejoin())
 
     # -----------------------------------------------------------------
-    # QUERYHIT handling (reverse-path routing)
+    # Xử lý QUERYHIT (routing theo đường ngược)
     # -----------------------------------------------------------------
     async def handle_queryhit(self, message):
         query_id = message["query_id"]
@@ -319,7 +585,7 @@ class P2PNode:
 
         short_qid = query_id.split("-")[0]
 
-        # Dedup key = (query_id, found_at_port)
+        # Khóa chống trùng = (query_id, found_at_port)
         key = (query_id, found_at)
         if key in self.processed_queryhits:
             self.duplicate_queryhits_dropped += 1
@@ -327,13 +593,13 @@ class P2PNode:
         self.processed_queryhits.add(key)
 
         if self.port == origin_port:
-            # Strict guard: only accept QUERYHITs matching our CURRENT query.
-            # This prevents stale QUERYHITs from previous experiments (which
-            # survive double-RESET) from contaminating matched_peers_count.
+            # Guard nghiêm ngặt: chỉ nhận QUERYHIT khớp query HIỆN TẠI.
+            # Điều này chặn QUERYHIT cũ từ thí nghiệm trước (sống sót qua
+            # double-RESET) làm bẩn matched_peers_count.
             if query_id != self.current_query_id:
                 return
 
-            # ----- origin receives result -----
+            # ----- node gốc nhận kết quả -----
             if found_at not in self.matched_peer_ports:
                 self.matched_peer_ports.add(found_at)
                 self.matched_peers_count += 1
@@ -343,7 +609,7 @@ class P2PNode:
             hop_count = message.get("hop_count", 0)
             self.hops.append(hop_count)
 
-            # Latency from query start
+            # Latency tính từ lúc query bắt đầu
             start = self.query_start_time.get(query_id)
             if start is not None:
                 latency_ms = (time.perf_counter() - start) * 1000
@@ -359,7 +625,7 @@ class P2PNode:
             )
             return
 
-        # Intermediate peer - route QUERYHIT back toward origin
+        # Peer trung gian - route QUERYHIT ngược về node gốc
         next_hop = self.query_route_table.get(query_id)
         if next_hop is not None:
             ok = await self.send_queryhit_with_fallback(query_id, message)
@@ -395,6 +661,13 @@ class P2PNode:
                 "matched_peer_ports": list(self.matched_peer_ports),
                 "last_reset_time": self.last_reset_time,
                 "fallback_used": self.fallback_used,
+                "isolated": self.isolated,
+                "isolated_since": self.isolated_since,
+                "alive_neighbors_count": self.alive_neighbors_count,
+                "neighbor_count": len(self.neighbors),
+                "runtime_neighbors_count": len(self.runtime_neighbors),
+                "rejoin_attempts": self.rejoin_attempts,
+                "rejoin_success_count": self.rejoin_success_count,
             }
         }
         await self.send_message(reply_port, response)
@@ -413,27 +686,31 @@ class P2PNode:
         self.duplicate_queries_dropped = 0
         self.failed_forward_count = 0
         self.fallback_used = 0
+        self.rejoin_attempts = 0
+        self.rejoin_success_count = 0
+        self.last_rejoin_attempt = 0.0
         self.latencies.clear()
         self.hops.clear()
         self.query_start_time.clear()
         self.dead_neighbors.clear()
+        self.update_isolation_state()
         self.last_reset_time = time.time()
         print(f"[Peer {self.port}] State reset.")
 
     # -----------------------------------------------------------------
-    # QUERYHIT routing with alternate fallback
+    # Routing QUERYHIT với route dự phòng thay thế
     # -----------------------------------------------------------------
     async def send_queryhit_with_fallback(self, query_id, queryhit):
-        """Try primary route first; fall back to alternates sequentially.
+        """Thử route chính trước; fallback tuần tự sang route thay thế.
 
-        Sequential avoids the TCP connection leak that occurs when
-        asyncio.wait(FIRST_COMPLETED) cancels tasks mid-connection
-        (CancelledError bypasses except Exception, leaving sockets open).
+        Cách tuần tự tránh leak kết nối TCP khi
+        asyncio.wait(FIRST_COMPLETED) hủy task giữa kết nối
+        (CancelledError bỏ qua except Exception, làm socket còn mở).
         """
         short_qid = query_id.split("-")[0]
         primary = self.query_route_table.get(query_id)
 
-        # Collect: primary first, then alternates (dedup)
+        # Gom route: route chính trước, sau đó route thay thế (chống trùng)
         seen = set()
         candidates = []
         dead_candidates = []
@@ -453,7 +730,7 @@ class P2PNode:
                     dead_candidates.append(alt)
                     seen.add(alt)
 
-        # All routes dead - try them anyway (mirrors QUERY forwarding)
+        # Mọi route đều chết - vẫn thử lại (giống chuyển tiếp QUERY)
         if not candidates and dead_candidates:
             print(
                 f"[Peer {self.port}] QUERYHIT qid={short_qid}: "
@@ -494,21 +771,21 @@ class P2PNode:
         return False
 
     # -----------------------------------------------------------------
-    # Persistent outbound connections
+    # Kết nối gửi ra duy trì lâu dài
     # -----------------------------------------------------------------
     async def _get_writer(self, port):
-        """Return an open StreamWriter to *port*, creating one if needed.
+        """Trả về StreamWriter đang mở tới *port*, tạo mới nếu cần.
 
-        Stores (writer, reader) so we can detect half-open connections
-        (remote close) via reader.at_eof() - writer.is_closing() only
-        catches local closes.
+        Lưu (writer, reader) để phát hiện kết nối nửa mở
+        (đóng từ phía xa) qua reader.at_eof(); writer.is_closing() chỉ
+        bắt được đóng cục bộ.
         """
         entry = self.out_writers.get(port)
         if entry is not None:
             writer, reader = entry
             if not writer.is_closing() and not reader.at_eof():
                 return writer
-            # Stale - close and recreate below
+            # Kết nối cũ - đóng và tạo lại bên dưới
             try:
                 writer.close()
             except Exception:
@@ -523,7 +800,7 @@ class P2PNode:
         return writer
 
     async def _close_all_writers(self):
-        """Close all persistent outbound connections."""
+        """Đóng toàn bộ kết nối gửi ra duy trì lâu dài."""
         for port, (writer, _) in list(self.out_writers.items()):
             try:
                 writer.close()
@@ -532,7 +809,7 @@ class P2PNode:
         self.out_writers.clear()
 
     async def _close_inbound_writers(self):
-        """Close inbound connections so a shut down peer cannot process stale sends."""
+        """Đóng kết nối inbound để peer đã shutdown không xử lý send cũ."""
         writers = list(self.in_writers)
         for writer in writers:
             try:
@@ -547,13 +824,12 @@ class P2PNode:
         self.in_writers.clear()
 
     # -----------------------------------------------------------------
-    # Low-level send
+    # Gửi message mức thấp
     # -----------------------------------------------------------------
     async def send_message(self, port, message):
-        """Send one JSON-line message to *port* via persistent connection.
+        """Gửi một message JSON-line tới *port* qua kết nối persistent.
 
-        On any write error the cached writer is discarded and one retry
-        with a fresh connection is attempted.
+        Nếu có lỗi ghi, bỏ writer cache và retry một lần bằng kết nối mới.
         """
         for attempt in range(2):
             try:
@@ -561,7 +837,7 @@ class P2PNode:
                 payload = json.dumps(message) + "\n"
                 writer.write(payload.encode())
                 await writer.drain()
-                # Successful write - neighbour is alive
+                # Ghi thành công - neighbor còn sống
                 if port in self.dead_neighbors:
                     self.dead_neighbors.discard(port)
                 return True
@@ -575,7 +851,7 @@ class P2PNode:
                     )
                 return False
             except asyncio.TimeoutError:
-                # Connection timed out - neighbour is busy, not dead.
+                # Kết nối timeout - neighbor đang bận, không hẳn là chết.
                 self.out_writers.pop(port, None)
                 return False
             except OSError as e:
@@ -595,12 +871,13 @@ class P2PNode:
 
 
 # -----------------------------------------------------------------
-# Script entry point
+# Điểm vào script
 # -----------------------------------------------------------------
 if __name__ == "__main__":
     peer_id = int(sys.argv[1])
     topology = json.load(open("topology.json"))
     port = topology["peers"][peer_id]["port"]
+    known_ports = [p["port"] for p in topology["peers"]]
     neighbors = []
     for a, b in topology["edges"]:
         if a == peer_id:
@@ -608,7 +885,7 @@ if __name__ == "__main__":
         if b == peer_id:
             neighbors.append(topology["peers"][a]["port"])
     local_files = topology["files"][str(peer_id)]
-    node = P2PNode(peer_id, port, neighbors, local_files)
+    node = P2PNode(peer_id, port, neighbors, local_files, known_ports)
     try:
         asyncio.run(node.start())
     except KeyboardInterrupt:

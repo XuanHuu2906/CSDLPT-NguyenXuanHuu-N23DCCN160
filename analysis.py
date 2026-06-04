@@ -4,20 +4,22 @@ import json
 import os
 import random
 import shutil
+import stat
 import statistics as st
+import time
 
 from query import (send_query, reset_all_peers,
                    collect_all_metrics, send_message, ALL_PORTS,
-                   restart_all_peers, is_port_free)
+                   restart_all_peers, is_port_free, check_isolation_all)
 
-BLOCKED_PEERS = set()  # No blocked peers with port range 6000-6099
+BLOCKED_PEERS = set()  # Không chặn peer nào trong dải port 6000-6099
 TTLS = [3, 5, 7]
 RUNS_PER_TTL = 10
-QUERY_TIMEOUT = 5       # default for TTL <= 5; TTL=7 uses 8
+QUERY_TIMEOUT = 5       # Mặc định cho TTL <= 5; TTL=7 dùng timeout riêng
 
 
 # =====================================================================
-# Topology helpers
+# Hàm hỗ trợ topology
 # =====================================================================
 def load_topology(path="topology.json"):
     return json.load(open(path))
@@ -33,14 +35,14 @@ def build_adjacency(topology):
 
 
 def count_peers_with_file(topology, keyword):
-    """Ground-truth: how many peers have this keyword in their file list."""
+    """Ground-truth: số peer có keyword này trong danh sách file."""
     return sum(
         1 for files in topology["files"].values() if keyword in files
     )
 
 
 def count_peers_with_file_by_id(topology, peer_ids, keyword):
-    """How many peers from a given set have the keyword."""
+    """Đếm số peer trong tập cho trước có keyword."""
     return sum(
         1 for pid in peer_ids
         if keyword in topology["files"].get(str(pid), [])
@@ -48,7 +50,7 @@ def count_peers_with_file_by_id(topology, peer_ids, keyword):
 
 
 def bfs_reachable(topology, origin_id, ttl):
-    """Return set of peer IDs reachable within *ttl* hops from origin_id."""
+    """Trả về tập ID peer reachable từ origin_id trong tối đa *ttl* hop."""
     adj = build_adjacency(topology)
     visited = {origin_id}
     queue = [(origin_id, 0)]
@@ -63,10 +65,14 @@ def bfs_reachable(topology, origin_id, ttl):
 
 def failure_reachability_snapshot(topology, adj, source_id, keyword_holders,
                                   killed_ids, ttl):
-    """Graph-side debug data for hub attack results."""
+    """Dữ liệu debug phía graph cho kết quả tấn công hub."""
     n = len(topology["peers"])
     unavailable = set(killed_ids) | BLOCKED_PEERS
     alive_nodes = set(range(n)) - unavailable
+    graph_isolated_node_ids = sorted(
+        node for node in alive_nodes
+        if not any(nb in alive_nodes for nb in adj[node])
+    )
 
     if source_id not in alive_nodes:
         return {
@@ -77,6 +83,9 @@ def failure_reachability_snapshot(topology, adj, source_id, keyword_holders,
             "reachable_holder_ids": [],
             "ttl_reachable_size": 0,
             "source_component_size": 0,
+            "graph_isolated_nodes_count": len(graph_isolated_node_ids),
+            "graph_isolated_node_ids": graph_isolated_node_ids,
+            "source_graph_isolated": False,
         }
 
     source_alive_neighbor_ids = sorted(
@@ -110,11 +119,14 @@ def failure_reachability_snapshot(topology, adj, source_id, keyword_holders,
         "reachable_holder_ids": reachable_holder_ids,
         "ttl_reachable_size": len(visited),
         "source_component_size": len(component),
+        "graph_isolated_nodes_count": len(graph_isolated_node_ids),
+        "graph_isolated_node_ids": graph_isolated_node_ids,
+        "source_graph_isolated": source_id in graph_isolated_node_ids,
     }
 
 
 def choose_failure_source(topology, adj, keyword_holders, kill_list, ttl=5):
-    """Pick a deterministic non-holder source that survives the first batch."""
+    """Chọn source không giữ file, xác định được và sống sau batch đầu."""
     n = len(topology["peers"])
     candidates = [
         i for i in range(n)
@@ -143,26 +155,87 @@ def get_file_pool(topology):
 
 
 def peer_id_from_port(topology, port):
-    """Convert a peer's port number to its 0-based peer ID using topology."""
+    """Đổi port của peer sang ID peer 0-based dựa trên topology."""
     for p in topology["peers"]:
         if p["port"] == port:
             return p["id"]
-    return port - topology["peers"][0]["port"]  # fallback
+    return port - topology["peers"][0]["port"]  # Dự phòng
 
 
 def peer_port(topology, peer_id):
-    """Convert a 0-based peer ID to its port number."""
+    """Đổi ID peer 0-based sang port tương ứng."""
     return topology["peers"][peer_id]["port"]
 
 
+async def active_isolation_scan(topology, alive_ports, graph_debug,
+                                wait_after_target=8.0):
+    """Force graph-isolated peers to detect isolation before running query."""
+    target_ids = graph_debug.get("graph_isolated_node_ids", [])
+    target_ports = [
+        peer_port(topology, node_id)
+        for node_id in target_ids
+        if peer_port(topology, node_id) in alive_ports
+    ]
+
+    target_detail = await check_isolation_all(
+        ports=target_ports,
+        wait=wait_after_target,
+        return_detail=True,
+    )
+
+    # Refresh the rest too, but the targeted pass above is what makes
+    # graph-isolated nodes actively discover they need to rejoin.
+    broadcast_ports = [p for p in alive_ports if p not in set(target_ports)]
+    broadcast_detail = await check_isolation_all(
+        ports=broadcast_ports,
+        wait=8.0,
+        return_detail=True,
+    )
+    target_responses = list(target_detail["responses"].values())
+    rejoin_needed = [
+        r for r in target_responses if r.get("isolated_after_scan")
+    ]
+    recovered = [
+        r for r in rejoin_needed if not r.get("isolated_after_rejoin")
+    ]
+    already_connected = [
+        r for r in target_responses if not r.get("isolated_after_scan")
+    ]
+
+    return {
+        "isolation_check_target_ids": target_ids,
+        "isolation_check_target_ports": target_ports,
+        "isolation_check_targeted": target_detail["requested_count"],
+        "isolation_check_delivered": target_detail["delivered_count"],
+        "isolation_check_delivered_ports": target_detail["delivered_ports"],
+        "isolation_check_completed": target_detail["completed_count"],
+        "isolation_check_completed_ports": target_detail["completed_ports"],
+        "isolation_check_still_isolated": sum(
+            1 for r in target_responses if r.get("isolated_after_rejoin")
+        ),
+        "isolation_check_detected": len(rejoin_needed),
+        "isolation_check_connected": len(already_connected),
+        "isolation_check_rejoin_needed": len(rejoin_needed),
+        "isolation_check_recovered": len(recovered),
+        "isolation_check_rejoin_attempted": sum(
+            r.get("rejoin_attempted", 0) for r in target_responses
+        ),
+        "isolation_check_rejoin_succeeded": sum(
+            r.get("rejoin_succeeded", 0) for r in target_responses
+        ),
+        "isolation_check_broadcast_delivered": broadcast_detail["delivered_count"],
+        "isolation_check_broadcast_completed": broadcast_detail["completed_count"],
+    }
+
+
 # =====================================================================
-# Single experiment runner
+# Chạy một thí nghiệm
 # =====================================================================
 async def run_single_experiment(source_port, keyword, ttl, timeout=QUERY_TIMEOUT):
     await reset_all_peers()
     metrics = await send_query(source_port, keyword, ttl, timeout)
 
-    # Compute derived metrics
+    # Tính các metrics suy ra
     total_with_file = count_peers_with_file(load_topology(), keyword)
 
     metrics["ttl"] = ttl
@@ -199,12 +272,19 @@ async def run_single_experiment(source_port, keyword, ttl, timeout=QUERY_TIMEOUT
         metrics["messages_sent"] / max(metrics["matched_peers_count"], 1)
     )
     metrics["fallback_used"] = metrics.get("fallback_used", 0)
+    metrics["isolated_nodes_count"] = metrics.get("isolated_nodes_count", 0)
+    metrics["source_isolated"] = metrics.get("source_isolated", False)
+    metrics["source_alive_neighbors_count"] = metrics.get(
+        "source_alive_neighbors_count", 0
+    )
+    metrics["rejoin_attempts"] = metrics.get("rejoin_attempts", 0)
+    metrics["rejoin_success_count"] = metrics.get("rejoin_success_count", 0)
 
     return metrics
 
 
 # =====================================================================
-# Multi-experiment runner
+# Chạy nhiều thí nghiệm
 # =====================================================================
 async def run_experiments(ttl_values=None, n_runs=None):
     if ttl_values is None:
@@ -217,7 +297,7 @@ async def run_experiments(ttl_values=None, n_runs=None):
     valid_sources = [i for i in range(100) if i not in BLOCKED_PEERS]
     all_results = []
 
-    # Pre-generate test cases so each case uses the same source & keyword for all TTLs
+    # Sinh trước test case để mỗi case dùng cùng source và keyword cho mọi TTL
     test_cases = []
     for run in range(n_runs):
         source_id = random.choice(valid_sources)
@@ -265,10 +345,10 @@ async def run_experiments(ttl_values=None, n_runs=None):
 
 
 # =====================================================================
-# Compute per-TTL statistics
+# Tính thống kê theo từng TTL
 # =====================================================================
 def compute_statistics(all_results):
-    """Group results by TTL and compute mean/std for key metrics."""
+    """Nhóm kết quả theo TTL và tính mean/std cho các metric chính."""
     by_ttl = {}
     for r in all_results:
         by_ttl.setdefault(r["ttl"], []).append(r)
@@ -285,6 +365,9 @@ def compute_statistics(all_results):
         overhead = [r["overhead_per_match"] for r in runs]
         failed = [r["failed_forward_count"] for r in runs]
         dead = [r["dead_neighbors_detected"] for r in runs]
+        isolated = [r.get("isolated_nodes_count", 0) for r in runs]
+        rejoin_attempts = [r.get("rejoin_attempts", 0) for r in runs]
+        rejoin_success = [r.get("rejoin_success_count", 0) for r in runs]
 
         def mean_std(values):
             return st.mean(values), st.stdev(values) if len(values) > 1 else 0
@@ -305,12 +388,15 @@ def compute_statistics(all_results):
             "overhead_per_match_mean": st.mean(overhead),
             "failed_mean": st.mean(failed),
             "dead_mean": st.mean(dead),
+            "isolated_mean": st.mean(isolated),
+            "rejoin_attempts_mean": st.mean(rejoin_attempts),
+            "rejoin_success_mean": st.mean(rejoin_success),
         }
     return stats
 
 
 # =====================================================================
-# CSV export
+# Xuất CSV
 # =====================================================================
 CSV_COLUMNS = [
     "ttl", "run", "keyword", "origin_port",
@@ -319,7 +405,8 @@ CSV_COLUMNS = [
     "avg_hops", "min_hops", "max_hops",
     "avg_latency_ms", "min_latency_ms", "max_latency_ms",
     "failed_forward_count", "dead_neighbors_detected", "overhead_per_match",
-    "fallback_used"
+    "fallback_used", "isolated_nodes_count", "source_isolated",
+    "source_alive_neighbors_count", "rejoin_attempts", "rejoin_success_count"
 ]
 
 
@@ -351,6 +438,9 @@ def save_summary_csv(stats, path="results/metrics_summary.csv"):
             "overhead_per_match_mean": f"{s['overhead_per_match_mean']:.1f}",
             "failed_mean": f"{s['failed_mean']:.1f}",
             "dead_mean": f"{s['dead_mean']:.1f}",
+            "isolated_mean": f"{s['isolated_mean']:.1f}",
+            "rejoin_attempts_mean": f"{s['rejoin_attempts_mean']:.1f}",
+            "rejoin_success_mean": f"{s['rejoin_success_mean']:.1f}",
         })
     cols = [
         "ttl", "coverage_mean", "coverage_std",
@@ -359,7 +449,8 @@ def save_summary_csv(stats, path="results/metrics_summary.csv"):
         "dup_ratio_mean",
         "avg_hops_mean", "avg_lat_mean",
         "overhead_per_match_mean",
-        "failed_mean", "dead_mean"
+        "failed_mean", "dead_mean",
+        "isolated_mean", "rejoin_attempts_mean", "rejoin_success_mean"
     ]
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
@@ -368,8 +459,28 @@ def save_summary_csv(stats, path="results/metrics_summary.csv"):
     print(f"Saved: {path}")
 
 
+def safe_remove_file(path, retries=5, delay=0.2):
+    """Remove a result file, retrying if Windows still has it locked."""
+    for attempt in range(retries):
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except PermissionError:
+            try:
+                os.chmod(path, stat.S_IWRITE)
+            except OSError:
+                pass
+            if attempt < retries - 1:
+                time.sleep(delay)
+                continue
+            print(f"WARNING: could not remove locked file: {path}")
+            return False
+
+
 # =====================================================================
-# Print stats table
+# In bảng thống kê
 # =====================================================================
 def print_stats_table(stats):
     sep = "=" * 90
@@ -397,7 +508,7 @@ def print_stats_table(stats):
 
 
 # =====================================================================
-# Charts (matplotlib)
+# Biểu đồ (matplotlib)
 # =====================================================================
 try:
     import matplotlib
@@ -408,7 +519,7 @@ except ImportError:
     HAVE_MPL = False
     print("[analysis.py] matplotlib not installed - charts will be skipped")
 
-# NetworkX for topology graphs
+# NetworkX dùng để vẽ graph topology
 try:
     import networkx as nx
     HAVE_NX = True
@@ -418,7 +529,7 @@ except ImportError:
 
 
 def plot_coverage_vs_overhead(stats):
-    """Coverage ratio vs messages sent (errorbar chart)."""
+    """Coverage ratio so với messages sent (biểu đồ errorbar)."""
     colors = {3: '#2196F3', 5: '#4CAF50', 7: '#F44336'}
     fig, ax = plt.subplots(figsize=(8, 6))
     for ttl in [3, 5, 7]:
@@ -453,11 +564,11 @@ def plot_coverage_vs_overhead(stats):
 
 
 def plot_ttl_metrics(stats):
-    """2x2 subplot: coverage, messages, duplicate ratio, latency."""
+    """Subplot 2x2: coverage, messages, duplicate ratio, latency."""
     ttls = sorted(stats.keys())
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
-    # Coverage
+    # Độ phủ
     ax = axes[0, 0]
     cov_means = [stats[t]["coverage_mean"] for t in ttls]
     cov_stds = [stats[t]["coverage_std"] for t in ttls]
@@ -469,7 +580,7 @@ def plot_ttl_metrics(stats):
     ax.set_ylim(0, 1.05)
     ax.grid(True, alpha=0.3, axis='y')
 
-    # Messages
+    # Số message
     ax = axes[0, 1]
     msg_means = [stats[t]["sent_mean"] for t in ttls]
     msg_stds = [stats[t]["sent_std"] for t in ttls]
@@ -480,7 +591,7 @@ def plot_ttl_metrics(stats):
     ax.set_title("Network Overhead")
     ax.grid(True, alpha=0.3, axis='y')
 
-    # Duplicate ratio
+    # Tỉ lệ duplicate
     ax = axes[1, 0]
     dup_means = [stats[t]["dup_ratio_mean"] for t in ttls]
     ax.bar([str(t) for t in ttls], dup_means,
@@ -490,7 +601,7 @@ def plot_ttl_metrics(stats):
     ax.set_title("Duplicate Query Ratio")
     ax.grid(True, alpha=0.3, axis='y')
 
-    # Latency
+    # Độ trễ
     ax = axes[1, 1]
     lat_means = [stats[t]["avg_lat_mean"] for t in ttls]
     ax.bar([str(t) for t in ttls], lat_means,
@@ -508,7 +619,7 @@ def plot_ttl_metrics(stats):
 
 
 def plot_duplicate_ratio(stats):
-    """Duplicate ratio bar chart (kept for backward compat)."""
+    """Biểu đồ cột duplicate ratio (giữ để tương thích ngược)."""
     ttl_values = sorted(stats.keys())
     ratios = [stats[t]["dup_ratio_mean"] for t in ttl_values]
     colors = ['#2196F3', '#4CAF50', '#F44336']
@@ -534,7 +645,7 @@ def plot_duplicate_ratio(stats):
 
 
 def plot_failure_case(results):
-    """Failure case: matched peers vs number of killed high-degree nodes."""
+    """Failure case: số peer match so với số node degree cao bị kill."""
     killed = [r["killed"] for r in results]
     matched = [r["matched"] for r in results]
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -560,7 +671,7 @@ def plot_failure_case(results):
 
 
 # =====================================================================
-# Topology graph (NetworkX)
+# Graph topology (NetworkX)
 # =====================================================================
 def save_topology_graph(topology):
     if not HAVE_NX or not HAVE_MPL:
@@ -589,7 +700,7 @@ def save_topology_graph(topology):
 
 
 def save_query_propagation_graph(topology, origin_id, keyword, ttl, suffix):
-    """BFS from origin to find reachable nodes, highlight matches."""
+    """BFS từ origin để tìm node reachable và tô nổi bật node match."""
     if not HAVE_NX or not HAVE_MPL:
         missing = []
         if not HAVE_NX:
@@ -617,29 +728,29 @@ def save_query_propagation_graph(topology, origin_id, keyword, ttl, suffix):
     fig, ax = plt.subplots(figsize=(14, 10))
     pos = nx.spring_layout(G, seed=42, k=0.3)
 
-    # Draw full topology in light gray
+    # Vẽ toàn bộ topology bằng màu xám nhạt
     all_ids = set(p["id"] for p in topology["peers"])
     unreachable = all_ids - reachable
     nx.draw_networkx_nodes(G, pos, nodelist=list(unreachable),
                            node_size=15, node_color='#e0e0e0', alpha=0.4, ax=ax)
 
-    # Reachable nodes
+    # Các node reachable
     reachable_no_origin_matched = reachable - matched - {origin_id}
     nx.draw_networkx_nodes(G, pos, nodelist=list(reachable_no_origin_matched),
                            node_size=30, node_color='#90CAF9', alpha=0.8, ax=ax)
 
-    # Matched nodes
+    # Các node match
     if matched:
         nx.draw_networkx_nodes(G, pos, nodelist=list(matched),
                                node_size=50, node_color='#4CAF50', alpha=0.9,
                                ax=ax)
 
-    # Origin
+    # Node origin
     nx.draw_networkx_nodes(G, pos, nodelist=[origin_id],
                            node_size=80, node_color='#F44336', alpha=0.9,
                            ax=ax)
 
-    # Edges within reachable subgraph
+    # Các cạnh trong subgraph reachable
     reachable_edges = [
         (a, b) for a, b in topology["edges"]
         if a in reachable and b in reachable
@@ -647,7 +758,7 @@ def save_query_propagation_graph(topology, origin_id, keyword, ttl, suffix):
     nx.draw_networkx_edges(G, pos, edgelist=list(reachable_edges),
                            alpha=0.5, edge_color='#2196F3', ax=ax)
 
-    # Legend
+    # Chú giải
     from matplotlib.lines import Line2D
     legend_elements = [
         Line2D([0], [0], marker='o', color='w', label='Origin',
@@ -675,7 +786,7 @@ def save_query_propagation_graph(topology, origin_id, keyword, ttl, suffix):
 
 
 # =====================================================================
-# Topology stats
+# Thống kê topology
 # =====================================================================
 def save_topology_stats(topology):
     if not HAVE_NX:
@@ -724,7 +835,7 @@ def _save_topology_stats_basic(topology):
     max_deg = max(d for _, d in degrees)
     density = len(topology["edges"]) / (n * (n - 1) / 2)
 
-    # BFS helpers
+    # Hàm hỗ trợ BFS
     def bfs_visited(adj, src):
         visited = {src}
         q = [src]
@@ -770,14 +881,14 @@ def _save_topology_stats_basic(topology):
 
 
 # =====================================================================
-# Failure experiment
+# Thí nghiệm lỗi node
 # =====================================================================
 async def run_failure_experiment(topology):
-    """Hub Attack: kill high-degree nodes that do NOT hold the keyword.
+    """Tấn công hub: kill các node degree cao nhưng KHÔNG giữ keyword.
 
-    Holders_left stays constant across all batches.  Matched is filtered
-    to only count keyword-holders that are still alive, so coverage drops
-    as the network fragments even though file copies remain.
+    holders_left giữ nguyên qua mọi batch. Matched được lọc để chỉ đếm
+    keyword-holder còn sống, nên coverage giảm do mạng bị phân mảnh dù
+    các bản sao file vẫn còn.
     """
     adj = build_adjacency(topology)
     node_degree = {i: len(adj[i]) for i in range(100)}
@@ -785,11 +896,11 @@ async def run_failure_experiment(topology):
 
     results = []
 
-    # 1) Restart ALL peers cleanly
+    # 1) Restart sạch toàn bộ peer
     print("  Restarting all peers for clean state...")
     await restart_all_peers()
 
-    # 2) Pick keyword with the most copies (>=10 required for stable baseline)
+    # 2) Chọn keyword có nhiều bản sao nhất (>=10 để baseline ổn định)
     pool = get_file_pool(topology)
     keyword = None
     keyword_holders = set()
@@ -813,13 +924,13 @@ async def run_failure_experiment(topology):
     total_holders = len(keyword_holders)
     keyword_holder_ports = {topology["peers"][i]["port"] for i in keyword_holders}
 
-    # 3) Build kill-list: top 20 highest-degree nodes EXCLUDING keyword-holders
+    # 3) Tạo kill-list: top 20 node degree cao nhất, loại trừ keyword-holder
     kill_list = []
     for node_id in degree_rank:
         if len(kill_list) >= 20:
             break
         if node_id in keyword_holders:
-            continue  # never kill a keyword-holder
+            continue  # Không bao giờ kill keyword-holder
         if node_id in BLOCKED_PEERS:
             continue
         kill_list.append(node_id)
@@ -828,8 +939,8 @@ async def run_failure_experiment(topology):
         print("  ERROR: not enough non-holder hubs to kill. Aborting.")
         return results
 
-    # 4) Pick source: not in kill-list, not a keyword-holder, and not
-    # isolated by the first batch in the graph model.
+    # 4) Chọn source: không nằm trong kill-list, không phải keyword-holder,
+    # và không bị batch đầu cô lập trong mô hình graph.
     source_id = choose_failure_source(
         topology, adj, keyword_holders, kill_list, ttl=5
     )
@@ -838,9 +949,15 @@ async def run_failure_experiment(topology):
         return results
     source_port = topology["peers"][source_id]["port"]
 
-    # ---- Phase 1: Baseline ----
+    # ---- Pha 1: Baseline ----
     await reset_all_peers()
-    valid_ports = list(keyword_holder_ports)  # all holders are alive
+    baseline_debug = failure_reachability_snapshot(
+        topology, adj, source_id, keyword_holders, set(), ttl=5
+    )
+    baseline_scan = await active_isolation_scan(
+        topology, ALL_PORTS, baseline_debug
+    )
+    valid_ports = list(keyword_holder_ports)  # Tất cả holder còn sống
     metrics = await send_query(source_port, keyword, ttl=5, timeout=QUERY_TIMEOUT,
                                valid_ports=valid_ports)
     baseline_matched = metrics["matched_peers_count"]
@@ -853,9 +970,6 @@ async def run_failure_experiment(topology):
         f"source={source_id}, kill_list={kill_list[:20]} "
         "(hubs, non-holders)"
     )
-    debug = failure_reachability_snapshot(
-        topology, adj, source_id, keyword_holders, set(), ttl=5
-    )
     results.append({
         "killed": 0,
         "matched": baseline_matched,
@@ -866,14 +980,23 @@ async def run_failure_experiment(topology):
         "ttl": 5,
         "kill_list": kill_list[:20],
         "killed_ids": [],
-        **debug,
+        "isolated_nodes_count": metrics.get("isolated_nodes_count", 0),
+        "source_isolated": metrics.get("source_isolated", False),
+        "source_alive_neighbors_count": metrics.get(
+            "source_alive_neighbors_count", 0
+        ),
+        "rejoin_attempts": metrics.get("rejoin_attempts", 0),
+        "rejoin_success_count": metrics.get("rejoin_success_count", 0),
+        **baseline_scan,
+        **baseline_debug,
     })
     coverage = baseline_matched / max(total_holders, 1) * 100
     print(f"  Baseline (0 killed): matched={baseline_matched}/{total_holders} "
-          f"({coverage:.1f}%), reachable={debug['reachable_holders']}, "
-          f"source_neighbors={debug['source_alive_neighbors']}")
+          f"({coverage:.1f}%), reachable={baseline_debug['reachable_holders']}, "
+          f"source_neighbors={baseline_debug['source_alive_neighbors']}, "
+          f"graph_isolated={baseline_debug['graph_isolated_nodes_count']}")
 
-    # ---- Phase 2: Incrementally kill hubs (5 per batch) ----
+    # ---- Pha 2: Kill hub tăng dần (5 node mỗi batch) ----
     killed_ports = set()
     killed_ids = set()
 
@@ -920,29 +1043,40 @@ async def run_failure_experiment(topology):
             print("  WARNING: No peers actually died. Skipping batch.")
             continue
 
-        # Reset alive peers, compute valid_ports = holders that are still alive
+        # Reset peer còn sống, tính valid_ports = các holder còn sống
         alive_ports = [p for p in ALL_PORTS if p not in killed_ports]
         alive_set = set(alive_ports)
         await reset_all_peers(ports=alive_ports)
+        debug = failure_reachability_snapshot(
+            topology, adj, source_id, keyword_holders, killed_ids, ttl=5
+        )
+        scan_debug = await active_isolation_scan(
+            topology, alive_ports, debug
+        )
 
         valid_ports = list(keyword_holder_ports & alive_set)
         metrics = await send_query(source_port, keyword, ttl=5,
                                    timeout=QUERY_TIMEOUT,
                                    valid_ports=valid_ports)
         matched = metrics["matched_peers_count"]
-        debug = failure_reachability_snapshot(
-            topology, adj, source_id, keyword_holders, killed_ids, ttl=5
-        )
         results.append({
             "killed": len(killed_ports),
             "matched": matched,
-            "holders_left": total_holders,  # always constant
+            "holders_left": total_holders,  # Luôn giữ nguyên
             "keyword": keyword,
             "source_id": source_id,
             "source_port": source_port,
             "ttl": 5,
             "kill_list": kill_list[:20],
             "killed_ids": sorted(killed_ids),
+            "isolated_nodes_count": metrics.get("isolated_nodes_count", 0),
+            "source_isolated": metrics.get("source_isolated", False),
+            "source_alive_neighbors_count": metrics.get(
+                "source_alive_neighbors_count", 0
+            ),
+            "rejoin_attempts": metrics.get("rejoin_attempts", 0),
+            "rejoin_success_count": metrics.get("rejoin_success_count", 0),
+            **scan_debug,
             **debug,
         })
         coverage = matched / max(total_holders, 1) * 100
@@ -950,12 +1084,20 @@ async def run_failure_experiment(topology):
               f"matched={matched}/{total_holders} ({coverage:.1f}%), "
               f"reachable={debug['reachable_holders']}, "
               f"source_neighbors={debug['source_alive_neighbors']}, "
-              f"component={debug['source_component_size']}")
+              f"component={debug['source_component_size']}, "
+              f"graph_isolated={debug['graph_isolated_nodes_count']}, "
+              f"check={scan_debug['isolation_check_completed']}/"
+              f"{scan_debug['isolation_check_targeted']}, "
+              f"detected={scan_debug['isolation_check_detected']}, "
+              f"connected={scan_debug['isolation_check_connected']}, "
+              f"still={scan_debug['isolation_check_still_isolated']}, "
+              f"recovered={scan_debug['isolation_check_recovered']}/"
+              f"{scan_debug['isolation_check_rejoin_needed']}")
         if matched > debug["reachable_holders"]:
             print("  WARNING: matched exceeds graph-reachable holders; "
                   "runtime state may still be stale.")
 
-    # Assert holders_left never changed
+    # Đảm bảo holders_left không bao giờ thay đổi
     assert all(r.get("holders_left", r.get("remaining_holders", 0)) == total_holders
                for r in results), \
         "BUG: holders_left changed - a keyword-holder was killed!"
@@ -986,7 +1128,17 @@ def save_failure_report(results):
                 f"source_alive_neighbors="
                 f"{r.get('source_alive_neighbors', '?')}, "
                 f"source_component_size="
-                f"{r.get('source_component_size', '?')}\n"
+                f"{r.get('source_component_size', '?')}, "
+                f"graph_isolated={r.get('graph_isolated_nodes_count', 0)}, "
+                f"check={r.get('isolation_check_completed', 0)}"
+                f"/{r.get('isolation_check_targeted', 0)}, "
+                f"delivered={r.get('isolation_check_delivered', 0)}, "
+                f"detected={r.get('isolation_check_detected', 0)}, "
+                f"connected={r.get('isolation_check_connected', 0)}, "
+                f"still={r.get('isolation_check_still_isolated', 0)}, "
+                f"runtime_isolated={r.get('isolated_nodes_count', 0)}, "
+                f"recovered={r.get('isolation_check_recovered', 0)}"
+                f"/{r.get('isolation_check_rejoin_needed', 0)}\n"
             )
             if r.get("matched", 0) > r.get("reachable_holders", 10**9):
                 f.write("    WARNING: matched exceeds graph-reachable holders.\n")
@@ -1002,26 +1154,26 @@ def save_failure_report(results):
 
 
 # =====================================================================
-# Main
+# Hàm chính
 # =====================================================================
 async def main():
     topology = load_topology()
     os.makedirs("results", exist_ok=True)
 
-    # Clean old output before starting fresh analysis
+    # Dọn output cũ trước khi bắt đầu phân tích mới
     for f in os.listdir("results"):
         if f.endswith((".csv", ".png", ".txt")):
-            os.remove(os.path.join("results", f))
+            safe_remove_file(os.path.join("results", f))
     print("Cleaned old results.")
 
-    # ---- Topology graphs & stats ----
+    # ---- Graph topology và thống kê ----
     print("\nSaving topology graph...")
     save_topology_graph(topology)
 
     print("\nSaving topology statistics...")
     save_topology_stats(topology)
 
-    # ---- Standard experiments ----
+    # ---- Thí nghiệm chuẩn ----
     print("\nRunning standard experiments (TTL=3,5,7)...")
     random.seed(42)
     all_results = await run_experiments(ttl_values=TTLS, n_runs=RUNS_PER_TTL)
@@ -1029,17 +1181,17 @@ async def main():
     stats = compute_statistics(all_results)
     print_stats_table(stats)
 
-    # CSV export
+    # Xuất CSV
     save_csv(all_results)
     save_summary_csv(stats)
 
-    # Charts
+    # Biểu đồ
     if HAVE_MPL:
         plot_coverage_vs_overhead(stats)
         plot_ttl_metrics(stats)
         plot_duplicate_ratio(stats)
 
-    # Query propagation graphs: use same sample (first test case) for all TTLs
+    # Graph lan truyền query: dùng cùng sample (test case đầu) cho mọi TTL
     if HAVE_MPL:
         print("\nSaving query propagation graphs...")
         first_case_results = [r for r in all_results if r["run"] == 0]
@@ -1056,17 +1208,6 @@ async def main():
                     str(ttl)
                 )
 
-    # ---- Failure experiment ----
-    print("\nRunning failure experiment...")
-    failure_results = await run_failure_experiment(topology)
-    if failure_results:
-        if HAVE_MPL:
-            plot_failure_case(failure_results)
-        save_failure_report(failure_results)
-    else:
-        print("  [Skipped failure report/chart - experiment was aborted.]")
-
-    print("\nAll experiments complete. Results saved in results/")
 
 
 if __name__ == "__main__":

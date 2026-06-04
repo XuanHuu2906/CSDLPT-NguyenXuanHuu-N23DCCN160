@@ -11,7 +11,7 @@ ALL_PORTS = [p["port"] for p in json.load(open("topology.json"))["peers"]]
 
 
 def is_port_free(port, host="127.0.0.1"):
-    """Return True if a peer process can bind host:port."""
+    """Trả về True nếu một process peer có thể bind host:port."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.bind((host, port))
@@ -23,14 +23,14 @@ def is_port_free(port, host="127.0.0.1"):
 
 
 async def restart_all_peers():
-    """Stop all peers via SHUTDOWN, verify they're dead, then restart.
+    """Dừng mọi peer bằng SHUTDOWN, xác minh đã chết, rồi khởi động lại.
 
-    Ensures peer file lists match topology.json (fixes coverage > 1
-    when topology was regenerated without restarting peers).
-    Waits for old processes to release their ports before spawning new
-    ones so we don't leak processes (port exhaustion / stale runtime).
+    Đảm bảo danh sách file của peer khớp với topology.json (sửa lỗi
+    coverage > 1 khi topology được sinh lại nhưng peer chưa restart).
+    Chờ process cũ nhả port trước khi tạo process mới để tránh rò rỉ
+    process (cạn port / runtime cũ còn sót).
     """
-    # 1. Send SHUTDOWN to all peers
+    # 1. Gửi SHUTDOWN tới toàn bộ peer
     results = await asyncio.gather(*[
         send_message(port, {"type": "SHUTDOWN"})
         for port in ALL_PORTS
@@ -38,13 +38,13 @@ async def restart_all_peers():
     delivered = sum(1 for r in results if r)
     print(f"[query.py] SHUTDOWN delivered to {delivered}/{len(ALL_PORTS)} peers")
 
-    # 2. Wait for ports to actually free up
-    # Give peers a moment to cancel heartbeat tasks and close writers
-    # before we start polling (nodes now close writers before
-    # server.wait_closed(), but 100 concurrent shutdowns still contend).
+    # 2. Chờ port thật sự được nhả
+    # Cho peer một chút thời gian để hủy heartbeat task và đóng writer
+    # trước khi bắt đầu polling (node hiện đóng writer trước
+    # server.wait_closed(), nhưng 100 shutdown đồng thời vẫn cạnh tranh).
     await asyncio.sleep(1.0)
 
-    # Poll all ports in parallel (up to 8 attempts, 0.5s gap = 4s)
+    # Poll tất cả port song song (tối đa 8 lần, cách 0.5s = 4s)
     stuck = set(ALL_PORTS)
     for attempt in range(8):
         ports_to_check = list(stuck)
@@ -61,7 +61,7 @@ async def restart_all_peers():
             f"after SHUTDOWN: {sorted(stuck)[:10]}..."
         )
 
-    # 3. Start fresh peers
+    # 3. Khởi động peer mới
     n = len(json.load(open("topology.json"))["peers"])
     started = 0
     for peer_id in range(n):
@@ -117,7 +117,7 @@ async def send_message(port, message, connect_timeout=3.0):
 
 
 async def collect_metrics_from(port, timeout=1.0):
-    """Collect metrics from a single peer. Returns dict with peer's metrics."""
+    """Thu metrics từ một peer. Trả về dict chứa metrics của peer đó."""
     result = {}
     received = asyncio.Event()
 
@@ -152,9 +152,9 @@ async def collect_metrics_from(port, timeout=1.0):
 
 
 async def reset_all_peers(ports=None):
-    """Send RESET to *ports* (default: ALL_PORTS) with concurrency limit.
+    """Gửi RESET tới *ports* (mặc định: ALL_PORTS) với giới hạn concurrency.
 
-    Returns the list of ports that were alive (RESET succeeded).
+    Trả về danh sách port còn sống (RESET thành công).
     """
     if ports is None:
         ports = ALL_PORTS
@@ -167,7 +167,7 @@ async def reset_all_peers(ports=None):
     results = await asyncio.gather(*[_reset_one(p) for p in ports])
     await asyncio.sleep(1.0)
 
-    # Second pass: only to peers that were alive (catches stale in-flight msgs)
+    # Lượt hai: chỉ gửi tới peer còn sống (bắt các message cũ còn đang truyền)
     alive = [p for p, ok in zip(ports, results) if ok]
     if alive:
         await asyncio.gather(*[_reset_one(p) for p in alive])
@@ -176,12 +176,94 @@ async def reset_all_peers(ports=None):
     return alive
 
 
-async def collect_all_metrics():
-    """Collect extended metrics from all 100 peers.
+async def check_isolation_all(ports=None, wait=8.0, return_detail=False):
+    """Ask peers to detect isolation, wait until each completed the scan."""
+    if ports is None:
+        ports = ALL_PORTS
+    ports = list(dict.fromkeys(ports))
+    if not ports:
+        if return_detail:
+            return {
+                "requested_ports": [],
+                "delivered_ports": [],
+                "completed_ports": [],
+                "responses": {},
+                "requested_count": 0,
+                "delivered_count": 0,
+                "completed_count": 0,
+            }
+        return []
 
-    Returns a dict with summed numeric fields and concatenated lists.
-    Uses a single shared server to avoid the Python 3.13 ProactorEventLoop
-    assertion crash that occurs when creating 100 temporary servers concurrently.
+    sem = asyncio.Semaphore(20)
+    request_id = str(uuid.uuid4())
+    responses = {}
+    response_event = asyncio.Event()
+
+    async def _receive_response(reader, writer):
+        try:
+            data = await asyncio.wait_for(reader.readline(), timeout=wait)
+            msg = json.loads(data.decode().strip())
+            if (msg.get("type") == "CHECK_ISOLATION_RESPONSE"
+                    and msg.get("request_id") == request_id):
+                responses[msg["port"]] = msg
+                response_event.set()
+        except Exception:
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(_receive_response, '127.0.0.1', 0)
+    reply_port = server.sockets[0].getsockname()[1]
+
+    try:
+        async def _check_one(p):
+            async with sem:
+                return await send_message(p, {
+                    "type": "CHECK_ISOLATION",
+                    "request_id": request_id,
+                    "reply_port": reply_port,
+                })
+
+        results = await asyncio.gather(*[_check_one(p) for p in ports])
+        delivered = [p for p, ok in zip(ports, results) if ok]
+
+        deadline = time.time() + wait
+        while len(responses) < len(delivered):
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(response_event.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            response_event.clear()
+
+        completed = [p for p in delivered if p in responses]
+        if return_detail:
+            return {
+                "requested_ports": ports,
+                "delivered_ports": delivered,
+                "completed_ports": completed,
+                "responses": responses,
+                "requested_count": len(ports),
+                "delivered_count": len(delivered),
+                "completed_count": len(completed),
+            }
+        return completed
+    finally:
+        server.close()
+        try:
+            await asyncio.wait_for(server.wait_closed(), timeout=2.0)
+        except (Exception, AssertionError):
+            pass
+
+
+async def collect_all_metrics():
+    """Thu metrics mở rộng từ toàn bộ 100 peer.
+
+    Trả về dict có các field số đã cộng và các list đã nối.
+    Dùng một shared server để tránh crash assertion của Python 3.13
+    ProactorEventLoop khi tạo đồng thời 100 server tạm.
     """
     total = {
         "messages_sent": 0,
@@ -194,9 +276,12 @@ async def collect_all_metrics():
         "latencies": [],
         "hops": [],
         "fallback_used": 0,
+        "isolated_nodes_count": 0,
+        "rejoin_attempts": 0,
+        "rejoin_success_count": 0,
     }
 
-    # Single shared server collects all responses keyed by peer_id
+    # Một server dùng chung thu tất cả phản hồi theo peer_id
     peer_results = {}  # peer_id -> dict
 
     async def shared_receive(reader, writer):
@@ -218,8 +303,8 @@ async def collect_all_metrics():
     reply_port = server.sockets[0].getsockname()[1]
 
     try:
-        # Send all requests concurrently with an aggregate timeout
-        # so a hung peer doesn't block collection forever.
+        # Gửi tất cả request đồng thời với timeout tổng
+        # để peer bị treo không chặn việc thu metrics mãi.
         try:
             await asyncio.wait_for(
                 asyncio.gather(*[
@@ -231,7 +316,7 @@ async def collect_all_metrics():
         except asyncio.TimeoutError:
             pass
 
-        # Give peers a moment to respond
+        # Cho peer một chút thời gian để phản hồi
         await asyncio.sleep(1.0)
     finally:
         server.close()
@@ -249,6 +334,10 @@ async def collect_all_metrics():
         total["failed_forward_count"] += r.get("failed_forward_count", 0)
         total["dead_neighbors_detected"] += r.get("dead_neighbors_detected", 0)
         total["fallback_used"] += r.get("fallback_used", 0)
+        if r.get("isolated", False):
+            total["isolated_nodes_count"] += 1
+        total["rejoin_attempts"] += r.get("rejoin_attempts", 0)
+        total["rejoin_success_count"] += r.get("rejoin_success_count", 0)
         total["latencies"].extend(r.get("latencies", []))
         total["hops"].extend(r.get("hops", []))
 
@@ -270,31 +359,31 @@ async def send_query(source_port, keyword, ttl, timeout=3, valid_ports=None):
     await send_message(source_port, query_msg)
     await asyncio.sleep(timeout)
     metrics = await collect_all_metrics()
-    # Override origin-only metrics from the source peer directly.
-    # Summing matched_peers_count across all peers is always inflated
-    # (every file-holder self-counts).  Never use the sum as fallback.
+    # Ghi đè metrics chỉ thuộc origin bằng dữ liệu trực tiếp từ source peer.
+    # Cộng matched_peers_count trên mọi peer luôn bị phóng đại
+    # (mỗi file-holder tự đếm). Không dùng tổng đó làm fallback.
     source_metrics = await collect_metrics_from(source_port, timeout=2.0)
     if not source_metrics:
-        # Retry once; source may be busy processing QUERYHITs
+        # Thử lại một lần; source có thể đang bận xử lý QUERYHIT
         await asyncio.sleep(0.3)
         source_metrics = await collect_metrics_from(source_port, timeout=2.0)
     if source_metrics:
         matched_ports = source_metrics.get("matched_peer_ports", None)
         if matched_ports is not None:
-            # Use the set of unique ports (more reliable than the counter)
+            # Dùng tập port duy nhất (đáng tin hơn counter)
             matched_ports_set = set(matched_ports)
             metrics["matched_peers_count"] = len(matched_ports_set)
             metrics["queryhit_count"] = source_metrics.get("queryhit_count", 0)
             metrics["latencies"] = source_metrics.get("latencies", [])
             metrics["hops"] = source_metrics.get("hops", [])
         else:
-            # Fallback: old node.py without matched_peer_ports; use counter directly
+            # Dự phòng: node.py cũ không có matched_peer_ports; dùng bộ đếm trực tiếp
             metrics["matched_peers_count"] = source_metrics.get("matched_peers_count", 0)
             metrics["queryhit_count"] = source_metrics.get("queryhit_count", 0)
             metrics["latencies"] = source_metrics.get("latencies", [])
             metrics["hops"] = source_metrics.get("hops", [])
     else:
-        # Source is dead or unresponsive; sum is unreliable
+        # Source chết hoặc không phản hồi; tổng không đáng tin
         print(
             f"[query.py] WARNING: source port {source_port} not responding "
             f"- setting matched_peers_count=0 (was {metrics['matched_peers_count']} from sum)"
@@ -303,17 +392,25 @@ async def send_query(source_port, keyword, ttl, timeout=3, valid_ports=None):
         metrics["queryhit_count"] = 0
         metrics["latencies"] = []
         metrics["hops"] = []
+        metrics["source_isolated"] = True
+        metrics["source_alive_neighbors_count"] = 0
 
-    # If valid_ports is provided, filter matched to only count
-    # peers that are both keyword-holders AND currently alive.
-    # Used by failure experiment (Hub Attack) to exclude dead peers
-    # and non-holders from the matched count.
+    if source_metrics:
+        metrics["source_isolated"] = bool(source_metrics.get("isolated", False))
+        metrics["source_alive_neighbors_count"] = source_metrics.get(
+            "alive_neighbors_count", 0
+        )
+
+    # Nếu valid_ports được cung cấp, lọc matched để chỉ đếm peer
+    # vừa là node giữ từ khóa vừa đang còn sống.
+    # Dùng trong thí nghiệm lỗi (Hub Attack) để loại peer chết
+    # và node không giữ từ khóa khỏi số matched.
     if valid_ports is not None and source_metrics:
         matched_ports_set = set(source_metrics.get("matched_peer_ports", []))
         valid_set = set(valid_ports)
         metrics["matched_peers_count"] = len(matched_ports_set & valid_set)
 
-    # Debug: if matched exceeds expected, log which ports are in the set
+    # Debug: nếu matched vượt kỳ vọng, log các port đang nằm trong tập
     topo = json.load(open("topology.json"))
     total_file = sum(
         1 for files in topo["files"].values() if keyword in files
@@ -334,7 +431,7 @@ async def send_query(source_port, keyword, ttl, timeout=3, valid_ports=None):
         )
         print(f"[DEBUG] matched_ports: {matched_ids}")
 
-    # Diagnose silent send failure
+    # Chẩn đoán lỗi gửi im lặng
     if metrics["messages_sent"] == 0 and matched == 0:
         dead = source_metrics.get("dead_neighbors_detected", 0) if source_metrics else 0
         neighbors = source_metrics.get("failed_forward_count", 0) if source_metrics else 0
@@ -375,6 +472,11 @@ async def main():
     print(f"queryhit_count:            {metrics['queryhit_count']}")
     print(f"failed_forward_count:      {metrics['failed_forward_count']}")
     print(f"dead_neighbors_detected:   {metrics['dead_neighbors_detected']}")
+    print(f"isolated_nodes_count:      {metrics.get('isolated_nodes_count', 0)}")
+    print(f"source_isolated:           {metrics.get('source_isolated', False)}")
+    print(f"source_alive_neighbors:    {metrics.get('source_alive_neighbors_count', 0)}")
+    print(f"rejoin_attempts:           {metrics.get('rejoin_attempts', 0)}")
+    print(f"rejoin_success_count:      {metrics.get('rejoin_success_count', 0)}")
     hops = metrics.get("hops", [])
     if hops:
         print(f"avg_hops:                  {sum(hops)/len(hops):.2f}")
